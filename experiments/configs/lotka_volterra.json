@@ -1,0 +1,53 @@
+{
+  "experiment_name": "lotka_volterra",
+  "benchmark": {
+    "name": "lotka_volterra",
+    "observed_data_seed": 42,
+    "T_max": 30.0,
+    "x0": 50,
+    "y0": 100,
+    "true_theta1": 0.5,
+    "true_theta2": 0.025,
+    "true_theta3": 0.025,
+    "true_theta4": 0.5
+  },
+  "methods": [
+    "async_propulate_abc",
+    "abc_smc_baseline"
+  ],
+  "inference": {
+    "max_simulations": 30000,
+    "n_workers": 48,
+    "k": 100,
+    "tol_init": 500000.0,
+    "n_generations": 1000,
+    "max_wall_time_s": 600,
+    "scheduler_type": "geometric_decay",
+    "perturbation_scale": 0.8,
+    "propulate_budget_mode": "total_simulations",
+    "kernel": "gaussian",
+    "amis_snapshots": 20
+  },
+  "execution": {
+    "n_replicates": 5,
+    "base_seed": 0
+  },
+  "plots": {
+    "posterior": true,
+    "archive_evolution": true,
+    "corner": true,
+    "tolerance_trajectory": true,
+    "quality_vs_time": true
+  },
+  "analysis": {
+    "target_wasserstein": 50.0
+  },
+  "paper": {
+    "experiment_role": "validity",
+    "method_comparison_roles": {
+      "async_propulate_abc": "proposed_async_method",
+      "pyabc_smc": "external_framework_reference",
+      "abc_smc_baseline": "main_sync_baseline"
+    }
+  }
+}

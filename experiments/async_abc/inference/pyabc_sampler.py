@@ -1,0 +1,574 @@
+"""Shared pyABC sampler factory.
+
+Centralises sampler construction for both
+:mod:`pyabc_wrapper` and :mod:`abc_smc_baseline`, avoiding duplication and
+keeping the MPI import path isolated behind the ``"mpi"`` backend branch.
+"""
+
+from __future__ import annotations
+
+import logging
+import random
+
+import numpy as np
+
+from ..utils.mpi import get_rank
+from ..utils.seeding import stable_seed
+
+logger = logging.getLogger(__name__)
+
+
+class CommWorldMap:
+    """COMM_WORLD-based blocking parallel map for pyABC's MappingSampler.
+
+    Replaces ``MPICommExecutor`` to avoid ``Create_intercomm`` /
+    ``Disconnect`` fragility on ParaStation MPI at high rank counts.
+    Uses only ``bcast``, ``send``, and ``recv`` on ``COMM_WORLD`` —
+    no inter-communicators.
+
+    Coordination model
+    ------------------
+    Root (rank 0) drives the computation. Workers (rank 1..N-1) spin
+    in :meth:`worker_loop` until root signals shutdown. Each ``map()``
+    call is a self-contained batch: root broadcasts the function,
+    distributes work items one at a time (for load balance), collects
+    results, and sends sentinels to park workers back in their
+    outer loop. The same ``CommWorldMap`` instance can service many
+    ``map()`` calls between construction and ``shutdown()``.
+
+    Rank protocol (per ``map()`` call, ``size > 1``)
+    ------------------------------------------------
+    ::
+
+        Root (rank 0)                   Workers (rank 1..N-1)
+        ──────────────                  ─────────────────────
+        bcast(("map", fn))  ──────►     tag, payload = bcast(None)
+                                        fn = payload
+        send(idx, item) ×N  ──────►     item = recv(source=0, tag=0)
+                                        idx, work = item
+                                        result = fn(work)
+        recv(result) ×N     ◄──────     send((idx, result), tag=1)
+        send(sentinel) ×N   ──────►     item is sentinel → break inner loop
+                                        (wait on next bcast)
+        shutdown():
+          bcast(("shutdown", ...))──►   tag == "shutdown" → exit worker_loop
+        COMM_WORLD.Barrier()            COMM_WORLD.Barrier()
+
+    After ``shutdown()`` the caller should call ``COMM_WORLD.Barrier()``
+    (the wrapper / baseline functions do this) and then proceed to
+    ``allgather`` of results if needed.
+
+    Known failure modes
+    -------------------
+    1. **Worker crash during** ``map()``. Root receives a
+       ``_WorkerError`` wrapper, drains remaining workers with sentinels,
+       and re-raises. Workers that haven't yet received a sentinel wait
+       at ``recv(source=0, tag=0)`` until the drain completes. See the
+       drain block inside :meth:`map`.
+
+    2. **Root exception before** ``shutdown()``. The caller MUST wrap the
+       root branch in ``try/finally`` and call ``cmap.shutdown()`` in
+       ``finally``. Without this, workers block forever at
+       ``bcast(None, root=0)``. This was the Apr 8 2026 teardown fix
+       (see ``.plans/bug-fixes/previous-fixes.md``).
+
+    3. **Worker crash between** ``map()`` **calls.** No liveness check — by
+       design, no heartbeat. Root's next ``bcast(("map", fn))`` hangs
+       because not all ranks participate. Job is eventually killed by
+       SLURM timeout. Trade-off rationale: see
+       ``.plans/diagnose/mpi-evaluation.md`` (Residual Risks section).
+
+    4. **Single-process fallback** (``self.size <= 1``). :meth:`map`
+       bypasses all MPI calls and runs ``[fn(item) for item in items]``
+       sequentially. Used in local ``--test`` runs without ``mpirun``.
+
+    Full design evaluation: ``.plans/diagnose/mpi-evaluation.md``.
+    Bug history: ``.plans/bug-fixes/previous-fixes.md``.
+
+    Usage (all ranks must call the same code path)::
+
+        cmap = CommWorldMap(MPI.COMM_WORLD)
+        if cmap.is_root:
+            try:
+                sampler = build_pyabc_sampler(..., mpi_map=cmap.map)
+                result = run_abc(sampler=sampler, ...)
+            finally:
+                cmap.shutdown()          # tells workers to exit
+        else:
+            cmap.worker_loop()           # blocks until shutdown
+        if comm.Get_size() > 1:
+            comm.Barrier()
+    """
+
+    _SENTINEL = None  # end-of-batch marker for work items
+
+    def __init__(self, comm):
+        self.comm = comm
+        self.rank = comm.Get_rank()
+        self.size = comm.Get_size()
+        self.is_root = self.rank == 0
+        self._shutdown = False
+
+    def map(self, fn, iterable):
+        """Distribute *fn* over *iterable* across MPI workers. Root-only.
+
+        Rank protocol (this call):
+
+        1. Broadcast ``("map", fn)`` so every worker's :meth:`worker_loop`
+           wakes up and receives the function to apply.
+        2. Seed each worker with one ``(idx, item)`` send on tag 0.
+        3. Collect results on tag 1 (``MPI.ANY_SOURCE``), dispatching a
+           new work item each time a worker reports done. Order is
+           preserved via the ``idx`` stored with each item.
+        4. Send a sentinel (``None``) to every worker when the queue
+           drains; workers exit their inner loop and wait on the next
+           :meth:`worker_loop` bcast.
+
+        If a worker raises, the exception comes back as a
+        ``_WorkerError`` wrapper on tag 1. Root drains every remaining
+        worker with sentinels before re-raising the original exception.
+
+        Single-process fallback: if ``self.size <= 1``, skip MPI entirely
+        and return ``[fn(item) for item in items]``.
+
+        Returns
+        -------
+        list
+            Results in submission order (matches ``iterable``).
+        """
+        items = list(iterable)
+
+        # Single-process fallback: no workers to distribute to.
+        if self.size <= 1:
+            return [fn(item) for item in items]
+
+        if not items:
+            self.comm.bcast(("map", fn), root=0)
+            for dest in range(1, self.size):
+                self.comm.send(self._SENTINEL, dest=dest, tag=0)
+            return []
+
+        from mpi4py import MPI
+
+        self.comm.bcast(("map", fn), root=0)
+
+        results = [None] * len(items)
+        next_item = 0
+        active = 0
+
+        # Seed each worker with one item
+        for dest in range(1, self.size):
+            if next_item < len(items):
+                self.comm.send((next_item, items[next_item]), dest=dest, tag=0)
+                next_item += 1
+                active += 1
+            else:
+                self.comm.send(self._SENTINEL, dest=dest, tag=0)
+
+        # Collect results and send more work dynamically
+        while active > 0:
+            status = MPI.Status()
+            response = self.comm.recv(source=MPI.ANY_SOURCE, tag=1, status=status)
+            source = status.Get_source()
+            idx, result_or_error = response
+
+            if isinstance(result_or_error, _WorkerError):
+                # Drain remaining active workers before re-raising
+                active -= 1
+                for dest in range(1, self.size):
+                    if dest != source:
+                        self.comm.send(self._SENTINEL, dest=dest, tag=0)
+                while active > 0:
+                    self.comm.recv(source=MPI.ANY_SOURCE, tag=1)
+                    active -= 1
+                raise result_or_error.exc
+
+            results[idx] = result_or_error
+            active -= 1
+
+            if next_item < len(items):
+                self.comm.send((next_item, items[next_item]), dest=source, tag=0)
+                next_item += 1
+                active += 1
+            else:
+                self.comm.send(self._SENTINEL, dest=source, tag=0)
+
+        return results
+
+    def shutdown(self):
+        """Tell every worker to exit :meth:`worker_loop`. Root-only.
+
+        Broadcasts ``("shutdown", None)``; every worker sees
+        ``tag == "shutdown"`` and falls out of its outer ``while True``.
+        Idempotent: a second call is a no-op.
+
+        MUST be called from a ``finally`` block around the root branch
+        (see :class:`CommWorldMap` failure mode #2). Without this, any
+        exception on root leaves workers blocked at ``bcast(None)``
+        forever.
+        """
+        if self._shutdown:
+            return
+        self._shutdown = True
+        if self.size > 1:
+            self.comm.bcast(("shutdown", None), root=0)
+
+    def worker_loop(self):
+        """Process map batches until shutdown. Workers-only (rank != 0).
+
+        Rank protocol (outer loop):
+
+        1. Wait on ``bcast(None, root=0)`` for the next tag.
+        2. If ``tag == "shutdown"``, return (exits this worker's
+           participation in CommWorldMap).
+        3. Otherwise ``payload`` is the user function ``fn``. Enter the
+           inner work loop:
+
+           * ``recv(source=0, tag=0)`` — next work item or sentinel.
+           * Sentinel → break inner loop, wait on next outer ``bcast``.
+           * Otherwise compute ``fn(work)`` and ``send((idx, result),
+             dest=0, tag=1)``. Exceptions are wrapped in
+             ``_WorkerError`` and sent back on the same tag so root can
+             drain and re-raise.
+
+        No liveness check: if this rank crashes between map batches,
+        root's next ``bcast`` hangs until SLURM timeout. See
+        :class:`CommWorldMap` failure mode #3.
+        """
+        while True:
+            tag, payload = self.comm.bcast(None, root=0)
+            if tag == "shutdown":
+                break
+            fn = payload
+            # Process items until sentinel
+            while True:
+                item = self.comm.recv(source=0, tag=0)
+                if item is self._SENTINEL:
+                    break
+                idx, work = item
+                try:
+                    result = fn(work)
+                    self.comm.send((idx, result), dest=0, tag=1)
+                except Exception as exc:
+                    self.comm.send((idx, _WorkerError(exc)), dest=0, tag=1)
+
+
+class _WorkerError:
+    """Wrapper to distinguish worker exceptions from normal results."""
+    __slots__ = ("exc",)
+
+    def __init__(self, exc):
+        self.exc = exc
+
+
+try:
+    # pyabc is an optional dependency at import time; build_pyabc_sampler
+    # imports it lazily. Without pyabc the class below is never instantiated.
+    from pyabc.sampler import MappingSampler as _MappingSamplerBase
+except ImportError:  # pragma: no cover - environments without pyabc
+    _MappingSamplerBase = object
+
+
+# Per-process record of which (run_seed, rank, generation) triples have
+# already seeded the global RNGs — see SeededMappingSampler.map_function.
+_SEEDED_GLOBAL_KEYS: set = set()
+
+
+def _seed_worker_globals(run_seed: int, t: int) -> None:
+    """Seed the global RNGs once per (run_seed, MPI rank, generation).
+
+    The first work item a process handles for generation *t* seeds the
+    global ``np.random`` and ``random`` deterministically; subsequent items
+    in the same generation continue the streams. Cross-rank streams are
+    decorrelated by including the rank in the BLAKE2b-derived seed.
+    """
+    key = (int(run_seed), get_rank(), int(t))
+    if key in _SEEDED_GLOBAL_KEYS:
+        return
+    _SEEDED_GLOBAL_KEYS.add(key)
+    seed = stable_seed("pyabc-worker-globals", *key)
+    np.random.seed(seed % (2**32))
+    random.seed(seed)
+
+
+def _reset_seeded_global_keys() -> None:
+    """Test hook: forget which (run_seed, rank, t) triples seeded globals."""
+    _SEEDED_GLOBAL_KEYS.clear()
+
+
+class SeededMappingSampler(_MappingSamplerBase):
+    """pyABC ``MappingSampler`` with deterministic worker RNG seeding.
+
+    Upstream ``MappingSampler.map_function`` reseeds the global
+    ``np.random``/``random`` from OS entropy once **per work item**
+    (pyabc/sampler/mapping.py). That makes the baseline's proposal sampling
+    non-reproducible from the config seed and restarts the entropy stream on
+    every item. This subclass replaces the per-item entropy reseed with one
+    deterministic reseed per (run_seed, MPI rank, generation) — reproducible
+    from the replicate seed and decorrelated across ranks — and otherwise
+    mirrors the upstream sampling loop exactly.
+
+    Run-level bit-reproducibility is still bounded by the dynamic dispatch of
+    items to ranks (arrival order), matching the caveat documented for the
+    asynchronous side.
+    """
+
+    def __init__(self, map_=map, mapper_pickles: bool = False, *, run_seed: int):
+        super().__init__(map_=map_, mapper_pickles=mapper_pickles)
+        self._run_seed = int(run_seed)
+        self._t = -1
+
+    def __getstate__(self):
+        return (super().__getstate__(), self._run_seed, self._t)
+
+    def __setstate__(self, state):
+        base_state, self._run_seed, self._t = state
+        super().__setstate__(base_state)
+
+    def sample_until_n_accepted(self, n, simulate_one, t, **kwargs):
+        # Record the generation index so the pickled self carried inside the
+        # mapped partial (functools.partial(self.map_function, ...)) knows t
+        # on the workers.
+        self._t = int(t)
+        return super().sample_until_n_accepted(n, simulate_one, t, **kwargs)
+
+    def map_function(self, simulate_one, _):
+        # Mirrors pyabc 0.12.17 MappingSampler.map_function except that the
+        # per-item `np.random.seed(); random.seed()` OS-entropy reseed is
+        # replaced by the deterministic once-per-(seed, rank, t) reseed.
+        _seed_worker_globals(self._run_seed, self._t)
+        simulate_one = self.unpickle(simulate_one)
+
+        nr_simulations = 0
+        sample = self._create_empty_sample()
+
+        while True:
+            new_sim = simulate_one()
+            nr_simulations += 1
+            sample.append(new_sim)
+            if new_sim.accepted:
+                break
+
+        return sample, nr_simulations
+
+
+
+def population_weight(weights, pos: int):
+    """The ``pos``-th population weight as pyABC hands it back, or ``None``.
+
+    ``History.get_distribution`` returns the weights as a numpy array. The
+    record builders used to accept only a pandas Series (``hasattr(w, "iloc")``)
+    and wrote ``None`` for anything else, so every stored synchronous population
+    lost its importance weights and was later scored uniformly (2026-09-21).
+    """
+    if weights is None:
+        return None
+    if hasattr(weights, "iloc"):
+        return float(weights.iloc[pos])
+    return float(weights[pos])
+
+def _pyabc_parallel_safe(simulate_fn) -> bool:
+    """Return whether a benchmark can be shipped to parallel pyABC workers."""
+    owner = getattr(simulate_fn, "__self__", None)
+    if owner is None:
+        return True
+
+    if hasattr(owner, "PYABC_PARALLEL_SAFE"):
+        return bool(getattr(owner, "PYABC_PARALLEL_SAFE"))
+    return bool(getattr(owner, "MULTIPROCESSING_SAFE", True))
+
+
+def resolve_pyabc_parallel_backend(
+    inference_cfg,
+    method_name: str,
+    simulate_fn=None,
+) -> str:
+    """Return the pyABC backend that should be used for this run.
+
+    Policy:
+    - single-worker runs default to ``multicore`` for a local single-core sampler
+    - parallel runs always use ``mpi`` for consistent comparisons
+    - an explicit ``multicore`` request is overridden to ``mpi`` when
+      ``n_workers > 1``
+    """
+    n_workers = max(1, int(inference_cfg.get("n_workers", 1)))
+    configured = inference_cfg.get("parallel_backend")
+
+    if n_workers <= 1:
+        return configured or "multicore"
+
+    if configured is None:
+        return "mpi"
+
+    if configured == "multicore":
+        logger.warning(
+            "Overriding %s parallel_backend=multicore to mpi because n_workers=%d. "
+            "Parallel pyABC runs use MPI for consistent scaling/comparison.",
+            method_name,
+            n_workers,
+        )
+        return "mpi"
+
+    return configured
+
+
+def resolve_pyabc_worker_count(
+    simulate_fn,
+    n_procs: int,
+    parallel_backend: str,
+    method_name: str,
+) -> int:
+    """Return a safe worker count for the given simulator/backend pair.
+
+    Some native simulator stacks are not safe to execute behind pyABC's local
+    multiprocessing samplers. Benchmarks can opt out by setting
+    ``MULTIPROCESSING_SAFE = False`` on the simulator instance.
+    """
+    if parallel_backend != "multicore" or n_procs <= 1:
+        return n_procs
+
+    if _pyabc_parallel_safe(simulate_fn):
+        return n_procs
+
+    owner = getattr(simulate_fn, "__self__", None)
+    owner_name = owner.__class__.__name__ if owner is not None else type(simulate_fn).__name__
+
+    logger.warning(
+        "Forcing %s to single-process pyABC execution because %s is marked "
+        "unsafe for parallel pyABC workers.",
+        method_name,
+        owner_name,
+    )
+    return 1
+
+
+def resolve_pyabc_client_max_jobs(
+    inference_cfg,
+    *,
+    parallel_backend: str,
+    n_procs: int,
+    mpi_sampler: str | None = None,
+) -> int | None:
+    """Return the client-side outstanding-job limit for pyABC MPI samplers."""
+    if parallel_backend != "mpi":
+        return None
+
+    configured = inference_cfg.get("pyabc_client_max_jobs")
+    if mpi_sampler == "mapping":
+        if configured not in (None, ""):
+            logger.warning(
+                "Ignoring pyabc_client_max_jobs=%s because pyabc_mpi_sampler=mapping "
+                "does not use speculative client-side futures.",
+                configured,
+            )
+        return None
+
+    if configured in (None, ""):
+        return max(1, int(n_procs))
+    return max(1, int(configured))
+
+
+def resolve_pyabc_mpi_sampler(
+    inference_cfg,
+    *,
+    parallel_backend: str,
+    method_name: str,
+) -> str | None:
+    """Return the pyABC MPI sampler strategy for this run.
+
+    After Phase 3 cleanup, only the CommWorldMap-backed ``"mapping"`` path
+    is supported. Legacy sampler names now raise ValueError.
+    """
+    if parallel_backend != "mpi":
+        return None
+
+    configured = inference_cfg.get("pyabc_mpi_sampler")
+    if configured in (None, "", "mapping"):
+        return "mapping"
+
+    raise ValueError(
+        f"Unknown pyabc_mpi_sampler={configured!r} for {method_name}. "
+        "Valid values: 'mapping'."
+    )
+
+
+def build_pyabc_sampler(
+    n_procs: int,
+    parallel_backend: str,
+    *,
+    mpi_sampler: str | None = None,
+    mpi_map=None,
+    client_max_jobs: int | None = None,
+    run_seed: int | None = None,
+):
+    """Construct a pyABC sampler.
+
+    Parameters
+    ----------
+    n_procs:
+        Number of parallel workers.
+    parallel_backend:
+        ``"multicore"`` — use :class:`pyabc.MulticoreEvalParallelSampler`
+        (or :class:`pyabc.SingleCoreSampler` when *n_procs* == 1).
+        ``"mpi"`` — wrap an MPI-backed ``map`` callable inside
+        :class:`pyabc.MappingSampler`.
+    mpi_sampler:
+        Strategy to use when *parallel_backend* is ``"mpi"``. Only
+        ``"mapping"`` (CommWorldMap) is supported after Phase 3 cleanup.
+    mpi_map:
+        Communicator-backed ``map``-like callable for the ``"mapping"``
+        MPI strategy, typically ``CommWorldMap.map``.
+    client_max_jobs:
+        Retained for forward-compat with non-mapping samplers. Currently
+        unused; the mapping path does not consume it. Kept so call sites
+        that pass it (e.g. wrapper's ``_run_with_map_callable``) do not
+        need immediate edits.
+    run_seed:
+        Replicate seed for deterministic worker RNG seeding on the mapping
+        path (see :class:`SeededMappingSampler`). ``None`` falls back to the
+        upstream ``MappingSampler`` with its per-item OS-entropy reseed —
+        pass the replicate seed from every production call site.
+
+    Returns
+    -------
+    pyabc.Sampler
+
+    Raises
+    ------
+    ValueError
+        If *parallel_backend* is not recognised, or if *mpi_sampler* is
+        set to anything other than ``"mapping"``.
+    """
+    import pyabc
+
+    if parallel_backend == "multicore":
+        if n_procs == 1:
+            return pyabc.SingleCoreSampler()
+        return pyabc.MulticoreEvalParallelSampler(n_procs)
+
+    elif parallel_backend == "mpi":
+        mpi_sampler = mpi_sampler or "mapping"
+        if mpi_sampler == "mapping":
+            if mpi_map is None:
+                raise ValueError(
+                    "The 'mpi' parallel_backend with pyabc_mpi_sampler='mapping' "
+                    "requires an existing communicator-backed map callable."
+                )
+            if run_seed is None:
+                logger.warning(
+                    "build_pyabc_sampler: no run_seed given for the mapping "
+                    "path — worker RNGs will be OS-entropy seeded per item "
+                    "(not reproducible from the config seed)."
+                )
+                return pyabc.MappingSampler(map_=mpi_map)
+            return SeededMappingSampler(map_=mpi_map, run_seed=run_seed)
+        raise ValueError(
+            f"Unknown mpi_sampler={mpi_sampler!r}. "
+            "Valid values: 'mapping'."
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown parallel_backend={parallel_backend!r}. "
+            "Valid values: 'multicore', 'mpi'."
+        )

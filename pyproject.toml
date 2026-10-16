@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "async-abc"
+version = "1.0.0"
+description = "Generation-free asynchronous ABC: experiment library, benchmarks and paper reproduction scripts."
+readme = "README.md"
+license = { text = "BSD-3-Clause" }
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.6",
+    "numpy>=1.24,<2",
+    "pandas>=1.5",
+    "POT>=0.8",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+# The asynchronous sampler is a Propulate propagator. Install the vendored copy
+# (third_party/propulate), NOT Propulate from PyPI, which lacks it.
+propulate = ["propulate"]
+pyabc = ["pyabc"]
+mpi = ["mpi4py"]
+test = ["pytest", "pytest-mpi", "pyabc"]
+
+[tool.uv.sources]
+propulate = { path = "third_party/propulate", editable = true }
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.package-dir]
+"" = "experiments"
+
+[tool.setuptools.packages.find]
+where = ["experiments"]
+include = ["async_abc*"]
+
+[tool.pytest.ini_options]
+testpaths = ["experiments/tests", "third_party/propulate/tests"]

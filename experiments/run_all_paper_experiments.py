@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Orchestrate all paper experiments.
+
+Usage
+-----
+Run every experiment in test mode::
+
+    python run_all_paper_experiments.py --test --output-dir /tmp/paper_results
+
+Run a subset::
+
+    python run_all_paper_experiments.py --test \\
+        --experiments gaussian_mean gandk \\
+        --output-dir /tmp/paper_results
+
+Full production run::
+
+    python run_all_paper_experiments.py --output-dir /path/to/results
+"""
+import argparse
+import csv
+import importlib.util
+import logging
+import sys
+import time
+import traceback
+from pathlib import Path
+
+EXPERIMENTS_DIR = Path(__file__).parent
+SCRIPTS_DIR = EXPERIMENTS_DIR / "scripts"
+CONFIGS_DIR = EXPERIMENTS_DIR / "configs"
+
+sys.path.insert(0, str(EXPERIMENTS_DIR))
+from async_abc.io.config import compose_run_mode
+from async_abc.utils.logging_utils import configure_logging
+from async_abc.utils.mpi import allreduce_max, is_root_rank
+from async_abc.utils.runner import compute_scaling_factor, format_duration, timing_summary_filename, write_timing_csv
+
+logger = logging.getLogger(__name__)
+
+
+def _read_runner_estimate(timing_csv: Path) -> float | None:
+    """Return estimated_full_s from the last row of a runner's timing CSV, or None."""
+    if not timing_csv.exists() or timing_csv.stat().st_size == 0:
+        return None
+    try:
+        with open(timing_csv) as f:
+            rows = list(csv.DictReader(f))
+        if rows:
+            val = rows[-1].get("estimated_full_s", "")
+            return float(val) if val else None
+    except Exception:
+        pass
+    return None
+
+
+def _verify_outputs_exist(name: str, output_dir: Path) -> tuple[bool, str | None]:
+    """Verify that a runner produced at least one non-empty CSV output.
+
+    Satisfies REPR-03 (Phase 4): after each runner exits cleanly, confirm that
+    its expected output directory contains at least one non-empty CSV file.
+
+    Parameters
+    ----------
+    name:
+        Experiment registry name (e.g. ``"gaussian_mean"``).
+    output_dir:
+        Root output directory passed to the orchestrator.
+
+    Returns
+    -------
+    tuple[bool, str | None]
+        ``(True, None)`` on success; ``(False, reason)`` on failure.
+    """
+    data_dir = output_dir / name / "data"
+    if not data_dir.is_dir():
+        return False, f"data directory missing: {data_dir}"
+    csvs = list(data_dir.glob("*.csv"))
+    if not csvs:
+        return False, f"data directory empty: {data_dir}"
+    if all(p.stat().st_size == 0 for p in csvs):
+        return False, f"all CSVs empty: {data_dir}"
+    return True, None
+
+
+# Ordered mapping: experiment_name → (runner_script, config_file)
+EXPERIMENT_REGISTRY = {
+    "gaussian_mean": ("gaussian_mean_runner.py", "gaussian_mean.json"),
+    "gandk": ("gandk_runner.py", "gandk.json"),
+    "lotka_volterra": ("lotka_volterra_runner.py", "lotka_volterra.json"),
+    "cellular_potts": ("cellular_potts_runner.py", "cellular_potts.json"),
+    "straggler_twinB_f0": ("straggler_runner.py", "straggler_twinB_f0.json"),
+    "straggler_twinB_f1": ("straggler_runner.py", "straggler_twinB_f1.json"),
+    "straggler_twinB_f5": ("straggler_runner.py", "straggler_twinB_f5.json"),
+    "straggler_twinB_f10": ("straggler_runner.py", "straggler_twinB_f10.json"),
+    "straggler_twinB_f20": ("straggler_runner.py", "straggler_twinB_f20.json"),
+    "straggler_twin_f0": ("straggler_runner.py", "straggler_twin_f0.json"),
+    "straggler_twin_f1": ("straggler_runner.py", "straggler_twin_f1.json"),
+    "straggler_twin_f5": ("straggler_runner.py", "straggler_twin_f5.json"),
+    "straggler_twin_f10": ("straggler_runner.py", "straggler_twin_f10.json"),
+    "straggler_twin_f20": ("straggler_runner.py", "straggler_twin_f20.json"),
+    "straggler_async_wall": ("straggler_runner.py", "straggler_async_wall.json"),
+    "straggler_async_sim": ("straggler_runner.py", "straggler_async_sim.json"),
+    "straggler_twin": ("straggler_runner.py", "straggler_twin.json"),
+    "hetero_twinprobe_s0p0": ("runtime_heterogeneity_runner.py", "hetero_twinprobe_s0p0.json"),
+    "hetero_twinprobe_s0p5": ("runtime_heterogeneity_runner.py", "hetero_twinprobe_s0p5.json"),
+    "hetero_twinprobe_s1p0": ("runtime_heterogeneity_runner.py", "hetero_twinprobe_s1p0.json"),
+    "hetero_twinprobe_s1p5": ("runtime_heterogeneity_runner.py", "hetero_twinprobe_s1p5.json"),
+    "hetero_twinprobe_s2p0": ("runtime_heterogeneity_runner.py", "hetero_twinprobe_s2p0.json"),
+    "hetero_async_sim": ("runtime_heterogeneity_runner.py", "hetero_async_sim.json"),
+    "hetero_twin": ("runtime_heterogeneity_runner.py", "hetero_twin.json"),
+    "hetero_twin_s0p0": ("runtime_heterogeneity_runner.py", "hetero_twin_s0p0.json"),
+    "hetero_twin_s0p5": ("runtime_heterogeneity_runner.py", "hetero_twin_s0p5.json"),
+    "hetero_twin_s1p0": ("runtime_heterogeneity_runner.py", "hetero_twin_s1p0.json"),
+    "hetero_twin_s1p5": ("runtime_heterogeneity_runner.py", "hetero_twin_s1p5.json"),
+    "hetero_twin_s2p0": ("runtime_heterogeneity_runner.py", "hetero_twin_s2p0.json"),
+    "hetero_twinB_s0p0": ("runtime_heterogeneity_runner.py", "hetero_twinB_s0p0.json"),
+    "hetero_twinB_s0p5": ("runtime_heterogeneity_runner.py", "hetero_twinB_s0p5.json"),
+    "hetero_twinB_s1p0": ("runtime_heterogeneity_runner.py", "hetero_twinB_s1p0.json"),
+    "hetero_twinB_s1p5": ("runtime_heterogeneity_runner.py", "hetero_twinB_s1p5.json"),
+    "hetero_twinB_s2p0": ("runtime_heterogeneity_runner.py", "hetero_twinB_s2p0.json"),
+    "scaling_kfrontier": ("scaling_runner.py", "scaling_kfrontier.json"),
+    "scaling_cpm_twin": ("scaling_runner.py", "scaling_cpm_twin.json"),
+    "sbc": ("sbc_runner.py", "sbc.json"),
+    # Multidim (g-and-k) + multimodal (bimodal) SBC for external-review concern 6.
+    "sbc_gandk": ("sbc_runner.py", "sbc_gandk.json"),
+    # 2x-budget g-and-k SBC: budget-limitation probe for the 4-D under-coverage.
+    "sbc_gandk_2x": ("sbc_runner.py", "sbc_gandk_2x.json"),
+    # Full-history vs top-k reporting probe for the 4-D under-coverage mechanism.
+    "sbc_gandk_fullhist": ("sbc_runner.py", "sbc_gandk_fullhist.json"),
+    "sbc_gandk_topm500": ("sbc_runner.py", "sbc_gandk_topm500.json"),
+    "sbc_gandk_topm1500": ("sbc_runner.py", "sbc_gandk_topm1500.json"),
+    "sbc_gaussian_fullhist": ("sbc_runner.py", "sbc_gaussian_fullhist.json"),
+    "sbc_bimodal_fullhist": ("sbc_runner.py", "sbc_bimodal_fullhist.json"),
+    "sbc_gaussian_archive": ("sbc_runner.py", "sbc_gaussian_archive.json"),
+    "sbc_bimodal": ("sbc_runner.py", "sbc_bimodal.json"),
+    "straggler": ("straggler_runner.py", "straggler.json"),
+    "runtime_heterogeneity": ("runtime_heterogeneity_runner.py", "runtime_heterogeneity.json"),
+    # Parameter-coupled runtime bias (paper Fig. fig_param_bias) reuses the
+    # heterogeneity runner with its own config (review II.8.6).
+    "parameter_bias": ("runtime_heterogeneity_runner.py", "parameter_bias.json"),
+    # No-AMIS arm of the coupling study (external review concern 5): amis_snapshots=0.
+    "parameter_bias_no_amis": ("runtime_heterogeneity_runner.py", "parameter_bias_no_amis.json"),
+    # T2.1 concern-5 completion: drain-after-deadline (censoring test) + a steeper
+    # runtime-coupling regime with its own AMIS-on/off + drain variants.
+    "parameter_bias_drain": ("runtime_heterogeneity_runner.py", "parameter_bias_drain.json"),
+    "parameter_bias_strong": ("runtime_heterogeneity_runner.py", "parameter_bias_strong.json"),
+    "parameter_bias_strong_no_amis": ("runtime_heterogeneity_runner.py", "parameter_bias_strong_no_amis.json"),
+    "parameter_bias_strong_drain": ("runtime_heterogeneity_runner.py", "parameter_bias_strong_drain.json"),
+    "scaling": ("scaling_runner.py", "scaling.json"),
+    "scaling_cpm": ("scaling_cpm_runner.py", "scaling_cpm.json"),
+    "sensitivity": ("sensitivity_runner.py", "sensitivity.json"),
+    "sensitivity_gandk": ("sensitivity_runner.py", "sensitivity_gandk.json"),
+    "ablation": ("ablation_runner.py", "ablation.json"),
+}
+
+
+def _resolve_experiments(requested: list[str]) -> list[str]:
+    """Expand the special 'all' token to every registered experiment."""
+    if "all" in requested:
+        return list(EXPERIMENT_REGISTRY.keys())
+    return requested
+
+
+
+def resolve_experiment(name: str):
+    """Resolve an experiment name to its ``(runner, config)`` pair.
+
+    The SBC family is open-ended: parameter sweeps (e.g. the archive-size /
+    snapshot-buffer dimension study) generate one experiment name per grid cell,
+    and every one of them runs ``sbc_runner.py`` against ``<name>.json``. Rather
+    than require a registry line per sweep cell, ``sbc_``-prefixed names fall
+    back to that convention. Explicit entries still win, so a family member can
+    override it.
+    """
+    if name in EXPERIMENT_REGISTRY:
+        return EXPERIMENT_REGISTRY[name]
+    if name.startswith("sbc_"):
+        return ("sbc_runner.py", f"{name}.json")
+    raise KeyError(name)
+
+
+def is_known_experiment(name: str) -> bool:
+    return name in EXPERIMENT_REGISTRY or name.startswith("sbc_")
+
+
+def _run_experiment(
+    name: str,
+    runner: str,
+    config: str,
+    output_dir: Path,
+    test_mode: bool,
+    small_mode: bool,
+    extend: bool = False,
+) -> tuple:
+    """Run a single experiment script as a subprocess.
+
+    Returns (returncode, elapsed_seconds).
+    """
+    runner_path = SCRIPTS_DIR / runner
+    argv = [
+        "--config", str(CONFIGS_DIR / config),
+        "--output-dir", str(output_dir),
+    ]
+    if test_mode:
+        argv.append("--test")
+    if small_mode:
+        argv.append("--small")
+    if extend:
+        argv.append("--extend")
+
+    logger.info("[run_all] Starting: %s", name)
+    t0 = time.time()
+    rc_local = 0
+    try:
+        module_name = f"run_all_{runner_path.stem}"
+        spec = importlib.util.spec_from_file_location(module_name, runner_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load runner module from {runner_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.main(argv)
+    except SystemExit as exc:
+        code = exc.code
+        rc_local = int(code) if isinstance(code, int) else 1
+    except Exception:
+        rc_local = 1
+        if is_root_rank():
+            logger.error(
+                "[run_all] Runner %s crashed:\n%s",
+                runner,
+                traceback.format_exc(),
+            )
+
+    elapsed = time.time() - t0
+    rc = allreduce_max(rc_local)
+    if is_root_rank():
+        if rc != 0:
+            logger.error("[run_all] FAILED: %s (exit %s)", name, rc)
+        else:
+            logger.info("[run_all] Done:    %s", name)
+    return rc, elapsed
+
+
+def main(argv: list[str] | None = None) -> None:
+    configure_logging()
+
+    parser = argparse.ArgumentParser(
+        description="Run all async-ABC paper experiments."
+    )
+    parser.add_argument(
+        "--output-dir", required=True, dest="output_dir",
+        help="Root directory for all experiment outputs.",
+    )
+    parser.add_argument(
+        "--test", action="store_true",
+        help="Test mode: small budget, local max 8 workers, SLURM max 48 workers, 2 replicates.",
+    )
+    parser.add_argument(
+        "--small", action="store_true",
+        help="Small mode: reduced ~10%%-compute config tier, stackable with --test.",
+    )
+    parser.add_argument(
+        "--experiments", nargs="+", metavar="NAME",
+        default=list(EXPERIMENT_REGISTRY.keys()),
+        help=(
+            "Experiments to run, or 'all' (default). "
+            f"Choices: {', '.join(EXPERIMENT_REGISTRY)}"
+        ),
+    )
+    parser.add_argument(
+        "--extend", action="store_true",
+        help="Skip parameter combinations already present in existing CSVs.",
+    )
+    args = parser.parse_args(argv)
+    args.experiments = _resolve_experiments(args.experiments)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Validate requested experiment names up front
+    unknown = [n for n in args.experiments if not is_known_experiment(n)]
+    if unknown:
+        parser.error(f"Unknown experiment(s): {', '.join(unknown)}. "
+                     f"Valid names: {', '.join(EXPERIMENT_REGISTRY)}")
+
+    failures = []
+    total_start = time.time()
+    total_estimate = 0.0
+    run_mode = compose_run_mode("small" if args.small else "full", args.test)
+
+    for name in args.experiments:
+        runner, config = resolve_experiment(name)
+        rc, elapsed = _run_experiment(
+            name,
+            runner,
+            config,
+            output_dir,
+            test_mode=args.test,
+            small_mode=args.small,
+            extend=args.extend,
+        )
+        if is_root_rank():
+            logger.info("[run_all] Time:    %s took %s", name, format_duration(elapsed))
+        est = None
+        if args.test or args.small:
+            runner_timing = output_dir / name / "data" / "timing.csv"
+            est = _read_runner_estimate(runner_timing)
+            if est is None:
+                factor, extra, note = compute_scaling_factor(
+                    CONFIGS_DIR / config,
+                    small_mode=args.small,
+                    test_mode=args.test,
+                )
+                est = elapsed * factor + extra
+            if is_root_rank():
+                total_estimate += est
+                logger.info(
+                    "[run_all] Estimate: %s full run ~%s",
+                    name,
+                    format_duration(est),
+                )
+        if is_root_rank():
+            write_timing_csv(output_dir / timing_summary_filename(run_mode), name, elapsed, est, args.test, run_mode)
+        outputs_ok = True
+        outputs_reason: str | None = None
+        if rc == 0 and is_root_rank():
+            outputs_ok, outputs_reason = _verify_outputs_exist(name, output_dir)
+            if not outputs_ok:
+                logger.error("[run_all] Missing outputs: %s — %s", name, outputs_reason)
+        if rc != 0:
+            failures.append(name)
+        elif not outputs_ok:
+            failures.append(name)
+
+    total_elapsed = time.time() - total_start
+    if is_root_rank():
+        logger.info("[run_all] Total runtime: %s", format_duration(total_elapsed))
+    if (args.test or args.small) and total_estimate > 0 and is_root_rank():
+        logger.info(
+            "[run_all] Estimated total (full run): ~%s",
+            format_duration(total_estimate),
+        )
+
+    if failures:
+        if is_root_rank():
+            logger.error("[run_all] %s experiment(s) failed: %s", len(failures), failures)
+        sys.exit(1)
+
+    if is_root_rank():
+        logger.info("[run_all] All %s experiment(s) completed successfully.", len(args.experiments))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1514 @@
+"""Tests for async_abc.benchmarks.*"""
+import builtins
+import importlib
+import json
+import pathlib
+import math
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import numpy as np
+import pytest
+
+from async_abc.benchmarks.gaussian_mean import GaussianMean
+from async_abc.benchmarks.gandk import GandK
+from async_abc.benchmarks.lotka_volterra import LotkaVolterra
+from async_abc.benchmarks import make_benchmark
+from async_abc.benchmarks.cellular_potts import (
+    _ensure_nastjapy_on_path,
+    denormalize_cpm_params,
+    normalize_cpm_params,
+)
+
+# ---------------------------------------------------------------------------
+# CPM helpers & fixtures
+# ---------------------------------------------------------------------------
+
+_CPM_TEMPLATE_DIR = Path(__file__).parents[1] / "assets" / "cellular_potts"
+
+
+def _nastjapy_available() -> bool:
+    try:
+        _ensure_nastjapy_on_path()
+        return True
+    except ImportError:
+        return False
+
+
+_NASTJAPY_AVAILABLE = _nastjapy_available()
+
+
+@pytest.fixture
+def cpm_config(tmp_path):
+    """Minimal CellularPotts config using real template files (nastjapy must be available)."""
+    if not _NASTJAPY_AVAILABLE:
+        pytest.skip("nastjapy not available — run with the repo-root .venv")
+    return {
+        "name": "cellular_potts",
+        "nastja_config_template": str(_CPM_TEMPLATE_DIR / "sim_config.json"),
+        "config_builder_params": str(_CPM_TEMPLATE_DIR / "config_builder_params.json"),
+        "distance_metric_params": str(_CPM_TEMPLATE_DIR / "distance_metric_params.json"),
+        "parameter_space": str(_CPM_TEMPLATE_DIR / "parameter_space_division_motility.json"),
+        "reference_data_path": str(tmp_path / "reference"),
+        "output_dir": str(tmp_path / "sims"),
+    }
+
+
+@pytest.fixture
+def cpm_mocks(tmp_path):
+    """Pre-built mock SimulationManager and DistanceMetric for injection."""
+    mock_sim = MagicMock()
+    mock_dist = MagicMock()
+    # Default: build_simulation_config returns a plausible config path with a real file
+    config_path = tmp_path / "cpm_test" / "eval000001" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("{}")
+    mock_sim.build_simulation_config.return_value = str(config_path)
+    # Default: calculate_distance returns a positive float
+    mock_dist.calculate_distance.return_value = 2.5
+    return mock_sim, mock_dist
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _bm_config(name, **kwargs):
+    """Return a minimal benchmark sub-config."""
+    cfg = {"name": name, "observed_data_seed": 0, "n_obs": 50}
+    cfg.update(kwargs)
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# GaussianMean
+# ---------------------------------------------------------------------------
+
+class TestGaussianMean:
+    def test_init_no_error(self):
+        GaussianMean(_bm_config("gaussian_mean"))
+
+    def test_limits_has_mu(self):
+        bm = GaussianMean(_bm_config("gaussian_mean"))
+        assert "mu" in bm.limits
+        lo, hi = bm.limits["mu"]
+        assert lo < hi
+
+    def test_simulate_returns_float(self):
+        bm = GaussianMean(_bm_config("gaussian_mean"))
+        loss = bm.simulate({"mu": 0.0}, seed=1)
+        assert isinstance(loss, float)
+        assert math.isfinite(loss)
+        assert loss >= 0.0
+
+    def test_simulate_true_params_smaller_loss(self):
+        """Loss at the true mu must be less than at a clearly wrong mu."""
+        bm = GaussianMean(_bm_config("gaussian_mean", true_mu=0.0, n_obs=500))
+        loss_true = bm.simulate({"mu": 0.0}, seed=5)
+        loss_wrong = bm.simulate({"mu": 4.0}, seed=5)
+        assert loss_true < loss_wrong
+
+    def test_simulate_deterministic_seed(self):
+        bm = GaussianMean(_bm_config("gaussian_mean"))
+        a = bm.simulate({"mu": 1.0}, seed=42)
+        b = bm.simulate({"mu": 1.0}, seed=42)
+        assert a == pytest.approx(b)
+
+    def test_simulate_different_seeds_differ(self):
+        bm = GaussianMean(_bm_config("gaussian_mean", n_obs=5))
+        a = bm.simulate({"mu": 1.0}, seed=1)
+        b = bm.simulate({"mu": 1.0}, seed=2)
+        # With only 5 obs, seeds will almost certainly give different sample means
+        assert a != pytest.approx(b)
+
+    def test_analytic_posterior_mean_is_float(self):
+        bm = GaussianMean(_bm_config("gaussian_mean"))
+        pm = bm.analytic_posterior_mean()
+        assert isinstance(pm, float)
+        assert math.isfinite(pm)
+
+    def test_analytic_posterior_mean_close_to_true(self):
+        """With many observations the posterior mean should be close to true mu."""
+        bm = GaussianMean(_bm_config("gaussian_mean", true_mu=1.5, n_obs=2000))
+        pm = bm.analytic_posterior_mean()
+        assert abs(pm - 1.5) < 0.2
+
+    def test_analytic_posterior_uses_uniform_prior(self):
+        """Analytic posterior must use the same Uniform prior as the ABC inference."""
+        # Symmetric prior: result should be close to observed_mean
+        bm_sym = GaussianMean(_bm_config(
+            "gaussian_mean", true_mu=0.0, n_obs=100,
+            prior_low=-5.0, prior_high=5.0,
+        ))
+        pm_sym = bm_sym.analytic_posterior_mean()
+        assert abs(pm_sym - bm_sym.observed_mean) < 1e-9
+
+        # Asymmetric prior that truncates: observed mean outside the bounds.
+        bm_asym = GaussianMean(_bm_config(
+            "gaussian_mean", true_mu=10.0, n_obs=100,
+            prior_low=-5.0, prior_high=5.0,
+        ))
+        pm_asym = bm_asym.analytic_posterior_mean()
+        # observed_mean ≈ 10 is 50 posterior sds above the upper bound, so the
+        # truncated posterior piles up just *inside* it: the mean sits strictly
+        # below 5.0 by ~scale^2/(observed_mean - 5), not exactly at 5.0.
+        assert pm_asym < 5.0
+        assert pm_asym == pytest.approx(4.998, abs=1e-3)
+
+    def test_analytic_posterior_mean_matches_its_own_sampler(self):
+        """The two analytic references must describe the same distribution.
+
+        ``analytic_posterior_mean`` used to clip ``observed_mean`` to the prior
+        bounds while ``analytic_posterior_samples`` drew from the truncated
+        normal; the two disagreed near a boundary.
+        """
+        for prior_low, prior_high, true_mu in [
+            (-5.0, 5.0, 0.0),     # far from both bounds
+            (-5.0, 5.0, 10.0),    # hard against the upper bound
+            (-5.0, 5.0, -10.0),   # hard against the lower bound
+        ]:
+            bm = GaussianMean(_bm_config(
+                "gaussian_mean", true_mu=true_mu, n_obs=100,
+                prior_low=prior_low, prior_high=prior_high,
+            ))
+            draws = bm.analytic_posterior_samples(200_000, seed=0)
+            assert bm.analytic_posterior_mean() == pytest.approx(
+                float(draws.mean()), abs=5e-4
+            )
+
+    def test_different_observed_seeds_give_different_data(self):
+        bm1 = GaussianMean(_bm_config("gaussian_mean", observed_data_seed=0))
+        bm2 = GaussianMean(_bm_config("gaussian_mean", observed_data_seed=99))
+        assert bm1.observed_mean != pytest.approx(bm2.observed_mean)
+
+
+# ---------------------------------------------------------------------------
+# GandK
+# ---------------------------------------------------------------------------
+
+class TestGandK:
+    def test_init_no_error(self):
+        GandK(_bm_config("gandk", n_obs=200))
+
+    def test_limits_has_all_params(self):
+        bm = GandK(_bm_config("gandk", n_obs=200))
+        for key in ("A", "B", "g", "k"):
+            assert key in bm.limits
+            lo, hi = bm.limits[key]
+            assert lo < hi
+
+    def test_simulate_returns_positive_float(self):
+        bm = GandK(_bm_config("gandk", n_obs=200))
+        loss = bm.simulate({"A": 3.0, "B": 1.0, "g": 2.0, "k": 0.5}, seed=0)
+        assert isinstance(loss, float)
+        assert math.isfinite(loss)
+        assert loss >= 0.0
+
+    def test_simulate_deterministic_seed(self):
+        bm = GandK(_bm_config("gandk", n_obs=200))
+        params = {"A": 3.0, "B": 1.0, "g": 2.0, "k": 0.5}
+        a = bm.simulate(params, seed=7)
+        b = bm.simulate(params, seed=7)
+        assert a == pytest.approx(b)
+
+    def test_simulate_true_params_smaller_loss(self):
+        """Loss at true params should be smaller than at clearly wrong params."""
+        true = {"A": 3.0, "B": 1.0, "g": 2.0, "k": 0.5}
+        wrong = {"A": 0.1, "B": 3.9, "g": 0.0, "k": 0.9}
+        bm = GandK(_bm_config("gandk", n_obs=500,
+                               true_A=3.0, true_B=1.0, true_g=2.0, true_k=0.5))
+        # Average over a few seeds to reduce noise
+        loss_true = np.mean([bm.simulate(true, seed=s) for s in range(10)])
+        loss_wrong = np.mean([bm.simulate(wrong, seed=s) for s in range(10)])
+        assert loss_true < loss_wrong
+
+    def test_summary_stats_shape(self):
+        bm = GandK(_bm_config("gandk", n_obs=200))
+        assert bm.observed_stats.shape == (7,)
+
+
+# ---------------------------------------------------------------------------
+# LotkaVolterra
+# ---------------------------------------------------------------------------
+
+class TestLotkaVolterra:
+    # Use small T_max and initial populations so tests are fast
+    _config = _bm_config("lotka_volterra", T_max=10.0, x0=50, y0=25)
+
+    def test_init_no_error(self):
+        LotkaVolterra(self._config)
+
+    def test_limits_has_all_params(self):
+        bm = LotkaVolterra(self._config)
+        for key in ("theta1", "theta2", "theta3", "theta4"):
+            assert key in bm.limits
+
+    def test_simulate_returns_finite_float(self):
+        bm = LotkaVolterra(self._config)
+        true_params = {"theta1": 0.5, "theta2": 0.025, "theta3": 0.025, "theta4": 0.5}
+        loss = bm.simulate(true_params, seed=0)
+        assert isinstance(loss, float)
+        assert math.isfinite(loss)
+        assert loss >= 0.0
+
+    def test_simulate_deterministic_seed(self):
+        bm = LotkaVolterra(self._config)
+        params = {"theta1": 0.5, "theta2": 0.025, "theta3": 0.025, "theta4": 0.5}
+        a = bm.simulate(params, seed=3)
+        b = bm.simulate(params, seed=3)
+        assert a == pytest.approx(b)
+
+    def test_simulate_different_seeds_may_differ(self):
+        # Use longer T_max and stable params so extinction is unlikely
+        bm = LotkaVolterra(_bm_config("lotka_volterra", T_max=30.0, x0=50, y0=25))
+        params = {"theta1": 0.5, "theta2": 0.025, "theta3": 0.025, "theta4": 0.5}
+        results = [bm.simulate(params, seed=s) for s in range(20)]
+        finite = [r for r in results if r < 1e5]
+        # With 20 seeds and T_max=30, at least some runs should be non-extinction
+        # and have varying losses due to stochasticity
+        if len(finite) >= 2:
+            assert len(set(finite)) > 1
+
+    def test_extinction_returns_large_loss(self):
+        """Very high predation rates cause extinction; loss should be large."""
+        bm = LotkaVolterra(self._config)
+        extreme_params = {"theta1": 0.1, "theta2": 10.0, "theta3": 10.0, "theta4": 10.0}
+        loss = bm.simulate(extreme_params, seed=0)
+        assert loss > 0.0
+        assert math.isfinite(loss)
+
+    def test_true_params_smaller_loss_than_bad(self):
+        bm = LotkaVolterra(_bm_config("lotka_volterra", T_max=20.0, x0=50, y0=25))
+        true_params = {"theta1": 0.5, "theta2": 0.025, "theta3": 0.025, "theta4": 0.5}
+        bad_params  = {"theta1": 5.0, "theta2": 0.5,   "theta3": 0.5,   "theta4": 5.0}
+        loss_true = np.mean([bm.simulate(true_params, seed=s) for s in range(5)])
+        loss_bad  = np.mean([bm.simulate(bad_params, seed=s)  for s in range(5)])
+        assert loss_true < loss_bad
+
+    def test_lotka_volterra_normalized_stats_balanced_scale(self):
+        """Normalized summary stats should give each dimension meaningful weight."""
+        bm = LotkaVolterra(_bm_config(
+            "lotka_volterra", T_max=20.0, x0=50, y0=25, normalize_stats=True,
+        ))
+        # Two param sets that differ subtly
+        p1 = {"theta1": 0.5, "theta2": 0.025, "theta3": 0.025, "theta4": 0.5}
+        p2 = {"theta1": 0.5, "theta2": 0.025, "theta3": 0.025, "theta4": 0.6}
+        d1 = bm.simulate(p1, seed=0)
+        d2 = bm.simulate(p2, seed=0)
+        # Both should be finite
+        assert math.isfinite(d1) and math.isfinite(d2)
+
+    def test_lotka_volterra_unnormalized_backward_compat(self):
+        """normalize_stats=False preserves raw Euclidean distance."""
+        bm = LotkaVolterra(_bm_config(
+            "lotka_volterra", T_max=20.0, x0=50, y0=25, normalize_stats=False,
+        ))
+        params = {"theta1": 0.5, "theta2": 0.025, "theta3": 0.025, "theta4": 0.5}
+        loss = bm.simulate(params, seed=0)
+        assert isinstance(loss, float)
+        assert loss >= 0.0
+
+    def test_lotka_volterra_retries_on_extinction(self):
+        """Retry loop should handle multiple extinction attempts."""
+        # Use seed=42 which is known to produce a stable trajectory
+        bm = LotkaVolterra(_bm_config(
+            "lotka_volterra", T_max=10.0, x0=50, y0=25,
+            observed_data_seed=42, max_extinction_retries=10,
+        ))
+        # Should have created valid observed_stats
+        assert len(bm.observed_stats) == 6
+        assert all(np.isfinite(bm.observed_stats))
+
+    def test_lotka_volterra_raises_after_max_retries(self, monkeypatch):
+        """If all retries produce extinction, raise RuntimeError."""
+        from async_abc.benchmarks import lotka_volterra as lv_mod
+
+        original_gillespie = lv_mod._gillespie
+
+        def always_extinct(*args, **kwargs):
+            times, xs, ys = original_gillespie(*args, **kwargs)
+            # Force extinction
+            xs[-1] = 0
+            return times, xs, ys
+
+        monkeypatch.setattr(lv_mod, "_gillespie", always_extinct)
+        with pytest.raises(RuntimeError, match="extinct"):
+            LotkaVolterra(_bm_config(
+                "lotka_volterra", T_max=10.0, x0=50, y0=25,
+                max_extinction_retries=3,
+            ))
+
+
+# ---------------------------------------------------------------------------
+# CellularPotts
+# ---------------------------------------------------------------------------
+
+class TestCellularPottsImport:
+    """Module-level import must always succeed regardless of nastjapy availability."""
+
+    def test_import_does_not_raise(self):
+        from async_abc.benchmarks import cellular_potts  # noqa: F401
+
+    def test_class_importable(self):
+        from async_abc.benchmarks.cellular_potts import CellularPotts  # noqa: F401
+
+    def test_missing_nastjapy_raises_import_error_on_init(self, tmp_path, monkeypatch):
+        """When nastja is unavailable from both env and fallback, __init__ raises ImportError."""
+        import async_abc.benchmarks.cellular_potts as cellular_potts
+
+        def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "nastja" or name.startswith("nastja."):
+                raise ModuleNotFoundError("No module named 'nastja'")
+            return real_import(name, globals, locals, fromlist, level)
+
+        real_import = builtins.__import__
+        monkeypatch.setattr(builtins, "__import__", blocked_import)
+
+        with pytest.raises(ImportError):
+            cellular_potts.CellularPotts({"name": "cellular_potts"})
+
+    def test_normalize_generated_config_paths_rewrites_repo_relative_include(self, tmp_path, monkeypatch):
+        from async_abc.benchmarks.cellular_potts import _rewrite_generated_config_paths as _normalize_generated_config_paths
+
+        include_target = tmp_path / "shared" / "filling.json"
+        include_target.parent.mkdir(parents=True)
+        include_target.write_text("{}")
+        monkeypatch.chdir(tmp_path)
+
+        config_dir = tmp_path / "runs" / "reference"
+        config_dir.mkdir(parents=True)
+        config_path = config_dir / "config.json"
+        config_path.write_text(json.dumps({"Include": [str(include_target.relative_to(tmp_path))]}))
+
+        normalized = _normalize_generated_config_paths(config_path)
+        data = json.loads(normalized.read_text())
+
+        assert data["Include"] == [str(include_target.resolve())]
+
+    def test_resolve_reference_data_path_finds_nested_generated_dir(self, tmp_path, monkeypatch):
+        import async_abc.benchmarks.cellular_potts as cellular_potts
+
+        configured = tmp_path / "experiments" / "data" / "cpm_reference" / "reference"
+        configured.mkdir(parents=True)
+        nested = (
+            tmp_path
+            / "experiments"
+            / "data"
+            / "cpm_reference"
+            / "experiments"
+            / "data"
+            / "cpm_reference"
+            / "reference"
+        )
+        (nested / "configs").mkdir(parents=True)
+        (nested / "000000").mkdir(parents=True)
+        (nested / "config.json").write_text("{}")
+        (nested / "cis.out").write_text("")
+        (nested / "000000" / "cellevents.log").write_text("")
+
+        monkeypatch.setattr(cellular_potts, "_REPO_ROOT", tmp_path)
+
+        resolved = cellular_potts._resolve_reference_data_path(
+            "experiments/data/cpm_reference/reference"
+        )
+
+        assert resolved == nested.resolve()
+
+    def test_resolve_reference_data_path_finds_arbitrarily_nested_dir(self, tmp_path, monkeypatch):
+        import async_abc.benchmarks.cellular_potts as cellular_potts
+
+        configured = tmp_path / "experiments" / "data" / "cpm_reference" / "reference"
+        configured.mkdir(parents=True)
+        nested = (
+            tmp_path
+            / "experiments"
+            / "data"
+            / "cpm_reference"
+            / "archive"
+            / "2026-03-18"
+            / "reference"
+        )
+        (nested / "configs").mkdir(parents=True)
+        (nested / "000000").mkdir(parents=True)
+        (nested / "config.json").write_text("{}")
+        (nested / "cis.out").write_text("")
+        (nested / "000000" / "cellevents.log").write_text("")
+
+        monkeypatch.setattr(cellular_potts, "_REPO_ROOT", tmp_path)
+
+        resolved = cellular_potts._resolve_reference_data_path(
+            "experiments/data/cpm_reference/reference"
+        )
+
+        assert resolved == nested.resolve()
+
+    def test_resolve_reference_data_path_accepts_csv_reference_dir(self, tmp_path, monkeypatch):
+        import async_abc.benchmarks.cellular_potts as cellular_potts
+
+        configured = tmp_path / "experiments" / "assets" / "cellular_potts" / "reference_data"
+        configured.mkdir(parents=True)
+        (configured / "output_cells-00000.csv").write_text("#CellID CenterX CenterY CenterZ\n1 0 0 0\n")
+
+        monkeypatch.setattr(cellular_potts, "_REPO_ROOT", tmp_path)
+
+        resolved = cellular_potts._resolve_reference_data_path(
+            "experiments/assets/cellular_potts/reference_data"
+        )
+
+        assert resolved == configured.resolve()
+
+    def test_ensure_reference_alias_reuses_canonical_reference_path(self, tmp_path):
+        from async_abc.benchmarks.cellular_potts import _ensure_reference_alias
+
+        output_dir = tmp_path / "experiments" / "data" / "cpm_reference"
+        actual = output_dir / "experiments" / "data" / "cpm_reference" / "reference"
+        (actual / "configs").mkdir(parents=True)
+        (actual / "000000").mkdir(parents=True)
+        (actual / "config.json").write_text("{}")
+        (actual / "cis.out").write_text("")
+        (actual / "000000" / "cellevents.log").write_text("")
+
+        alias = _ensure_reference_alias(output_dir, actual)
+
+        assert alias == output_dir / "reference"
+        assert alias.is_dir()
+        assert (alias / "config.json").is_file()
+
+    def test_ensure_reference_alias_replaces_empty_placeholder_dir(self, tmp_path):
+        from async_abc.benchmarks.cellular_potts import _ensure_reference_alias
+
+        output_dir = tmp_path / "experiments" / "data" / "cpm_reference"
+        placeholder = output_dir / "reference"
+        placeholder.mkdir(parents=True)
+        actual = output_dir / "archive" / "reference"
+        (actual / "configs").mkdir(parents=True)
+        (actual / "000000").mkdir(parents=True)
+        (actual / "config.json").write_text("{}")
+        (actual / "cis.out").write_text("")
+        (actual / "000000" / "cellevents.log").write_text("")
+
+        alias = _ensure_reference_alias(output_dir, actual)
+
+        assert alias == placeholder
+        assert (alias / "config.json").is_file()
+
+    def test_init_resolves_repo_relative_asset_paths(self, tmp_path, monkeypatch, cpm_mocks):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        if not _NASTJAPY_AVAILABLE:
+            pytest.skip("nastjapy not available — run with the repo-root .venv")
+
+        mock_sim, mock_dist = cpm_mocks
+        monkeypatch.chdir(tmp_path)
+        cfg = {
+            "name": "cellular_potts",
+            "nastja_config_template": "experiments/assets/cellular_potts/sim_config.json",
+            "config_builder_params": "experiments/assets/cellular_potts/config_builder_params.json",
+            "distance_metric_params": "experiments/assets/cellular_potts/distance_metric_params.json",
+            "parameter_space": "experiments/assets/cellular_potts/parameter_space_division_motility.json",
+            "reference_data_path": "experiments/data/cpm_reference/reference",
+            "output_dir": "experiments/data/cpm_sims",
+        }
+
+        bm = CellularPotts(cfg, _sim_manager=mock_sim, _distance_metric=mock_dist)
+
+        assert "division_rate" in bm.limits
+
+    def test_init_resolves_feature_space_model_and_csv_reference_assets(
+        self, tmp_path, monkeypatch, cpm_mocks
+    ):
+        import async_abc.benchmarks.cellular_potts as cellular_potts
+
+        if not _NASTJAPY_AVAILABLE:
+            pytest.skip("nastjapy not available — run with the repo-root .venv")
+
+        cellular_potts._ensure_nastjapy_on_path()
+        inference_distance = importlib.import_module("inference.distance")
+
+        captured: dict[str, object] = {}
+
+        class DummyDistanceMetricParams:
+            @classmethod
+            def model_validate(cls, data):
+                captured.update(data)
+                return object()
+
+        class DummyDistanceMetric:
+            def __init__(self, params):
+                self.params = params
+
+        monkeypatch.setattr(
+            inference_distance, "DistanceMetricParams", DummyDistanceMetricParams
+        )
+        monkeypatch.setattr(inference_distance, "DistanceMetric", DummyDistanceMetric)
+
+        reference_dir = tmp_path / "reference_data"
+        reference_dir.mkdir()
+        (reference_dir / "output_cells-00000.csv").write_text(
+            "#CellID CenterX CenterY CenterZ\n1 0 0 0\n"
+        )
+
+        mock_sim, _ = cpm_mocks
+        cfg = {
+            "name": "cellular_potts",
+            "nastja_config_template": "experiments/assets/cellular_potts/sim_config.json",
+            "config_builder_params": "experiments/assets/cellular_potts/config_builder_params.json",
+            "distance_metric_params": "experiments/assets/cellular_potts/distance_metric_params.json",
+            "parameter_space": "experiments/assets/cellular_potts/parameter_space_division_motility.json",
+            "reference_data_path": str(reference_dir),
+            "output_dir": str(tmp_path / "sims"),
+        }
+
+        bm = cellular_potts.CellularPotts(cfg, _sim_manager=mock_sim)
+
+        assert isinstance(bm._distance_metric, DummyDistanceMetric)
+        assert captured["reference_data"] == str(reference_dir.resolve())
+        assert captured["feature_space_model"] == str(
+            (
+                cellular_potts._REPO_ROOT
+                / "experiments"
+                / "assets"
+                / "cellular_potts"
+                / "sims_feature_space_model.json"
+            ).resolve()
+        )
+
+
+class TestCellularPotts:
+    """Tests for the real CellularPotts implementation (requires nastjapy venv)."""
+
+    # --- init & limits ---
+
+    def test_init_no_error(self, cpm_config, cpm_mocks):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        mock_sim, mock_dist = cpm_mocks
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        assert bm is not None
+
+    def test_limits_populated(self, cpm_config, cpm_mocks):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        mock_sim, mock_dist = cpm_mocks
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        assert "division_rate" in bm.limits
+        assert "motility" in bm.limits
+
+    def test_limits_bounds_correct(self, cpm_config, cpm_mocks):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        mock_sim, mock_dist = cpm_mocks
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        lo, hi = bm.limits["division_rate"]
+        assert lo == pytest.approx(0.0)
+        assert hi == pytest.approx(1.0)
+        lo2, hi2 = bm.limits["motility"]
+        assert lo2 == 0.0
+        assert hi2 == 1.0
+
+    def test_missing_required_key_raises(self, cpm_config):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        del cpm_config["reference_data_path"]
+        with pytest.raises(KeyError, match="reference_data_path"):
+            CellularPotts(cpm_config)
+
+    # --- simulate pipeline ---
+
+    def test_simulate_calls_build_config(self, cpm_config, cpm_mocks):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        mock_sim, mock_dist = cpm_mocks
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        bm.simulate({"division_rate": 0.1, "motility": 0.2}, seed=42)
+        mock_sim.build_simulation_config.assert_called_once()
+
+    def test_simulate_calls_run_simulation(self, cpm_config, cpm_mocks):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        mock_sim, mock_dist = cpm_mocks
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        bm.simulate({"division_rate": 0.1, "motility": 0.2}, seed=42)
+        mock_sim.run_simulation.assert_called_once()
+
+    def test_simulate_calls_calculate_distance(self, cpm_config, cpm_mocks):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        mock_sim, mock_dist = cpm_mocks
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        bm.simulate({"division_rate": 0.1, "motility": 0.2}, seed=42)
+        mock_dist.calculate_distance.assert_called_once()
+
+    def test_simulate_calls_cleanup(self, cpm_config, cpm_mocks):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        mock_sim, mock_dist = cpm_mocks
+        sim_dir = Path(mock_sim.build_simulation_config.return_value).parent
+        assert sim_dir.exists()
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        bm.simulate({"division_rate": 0.1, "motility": 0.2}, seed=42)
+        assert not sim_dir.exists()
+        mock_sim.cleanup_simdir.assert_called_once()
+
+    def test_simulate_restores_default_fp_state(self, cpm_config, cpm_mocks, monkeypatch):
+        import async_abc.benchmarks.cellular_potts as cellular_potts
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        mock_sim, mock_dist = cpm_mocks
+        restore_calls = []
+        monkeypatch.setattr(
+            cellular_potts,
+            "_restore_default_fp_state",
+            lambda: restore_calls.append(True),
+        )
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        bm.simulate({"division_rate": 0.1, "motility": 0.2}, seed=42)
+        assert restore_calls == [True]
+
+    def test_simulate_returns_float(self, cpm_config, cpm_mocks):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        mock_sim, mock_dist = cpm_mocks
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        result = bm.simulate({"division_rate": 0.1, "motility": 0.2}, seed=42)
+        assert isinstance(result, float)
+        assert result == pytest.approx(2.5)
+
+    def test_simulate_injects_seed_in_param_list(self, cpm_config, cpm_mocks):
+        """simulate() must include the seed as a named Parameter in ParameterList."""
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        mock_sim, mock_dist = cpm_mocks
+        captured: list = []
+        mock_sim.build_simulation_config.side_effect = (
+            lambda pl, **kw: captured.append(pl) or "/tmp/cpm_test/eval000001/config.json"
+        )
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        bm.simulate({"division_rate": 0.1, "motility": 0.2}, seed=99)
+        assert len(captured) == 1
+        param_names = [p.name for p in captured[0].parameters]
+        assert "random_seed" in param_names
+        seed_val = next(p.value for p in captured[0].parameters if p.name == "random_seed")
+        assert seed_val == 99
+
+    def test_simulate_denormalizes_public_params_before_building_config(self, cpm_config, cpm_mocks):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        mock_sim, mock_dist = cpm_mocks
+        captured: list = []
+        mock_sim.build_simulation_config.side_effect = (
+            lambda pl, **kw: captured.append(pl) or "/tmp/cpm_test/eval000001/config.json"
+        )
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        public_params = {"division_rate": 0.1, "motility": 0.2}
+        bm.simulate(public_params, seed=11)
+        param_values = {
+            param.name: param.value
+            for param in captured[0].parameters
+            if param.name in public_params
+        }
+        assert param_values == pytest.approx(denormalize_cpm_params(public_params))
+
+    def test_simulate_returns_inf_on_simulation_failure(self, cpm_config, cpm_mocks):
+        """Simulation runtime error → float('inf') (failed sim = infinitely-bad
+        discrepancy), not a re-raised exception and not NaN (which the ABCPMC
+        crash-loudly guard rejects, aborting the run)."""
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        mock_sim, mock_dist = cpm_mocks
+        mock_sim.run_simulation.side_effect = RuntimeError("NAStJA crashed")
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        result = bm.simulate({"division_rate": 0.1, "motility": 0.2}, seed=0)
+        assert result == float("inf")
+
+    def test_simulate_returns_inf_on_distance_failure(self, cpm_config, cpm_mocks):
+        """Distance computation failure → float('inf'), eval dir still removed."""
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        mock_sim, mock_dist = cpm_mocks
+        sim_dir = Path(mock_sim.build_simulation_config.return_value).parent
+        mock_dist.calculate_distance.side_effect = ValueError("feature extraction failed")
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        result = bm.simulate({"division_rate": 0.1, "motility": 0.2}, seed=0)
+        assert result == float("inf")
+        assert not sim_dir.exists()
+        mock_sim.cleanup_simdir.assert_called_once()
+
+    def test_simulate_maps_nan_distance_to_inf(self, cpm_config, cpm_mocks):
+        """A NaN distance from the metric is mapped to inf so the ABCPMC
+        loss guard does not abort the run on a degenerate feature vector."""
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        mock_sim, mock_dist = cpm_mocks
+        mock_dist.calculate_distance.return_value = float("nan")
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        result = bm.simulate({"division_rate": 0.1, "motility": 0.2}, seed=0)
+        assert result == float("inf")
+
+    def test_simulate_cleanup_called_even_on_distance_failure(self, cpm_config, cpm_mocks):
+        """The eval directory is always deleted, even when distance fails."""
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        mock_sim, mock_dist = cpm_mocks
+        sim_dir = Path(mock_sim.build_simulation_config.return_value).parent
+        mock_dist.calculate_distance.side_effect = RuntimeError("boom")
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        bm.simulate({"division_rate": 0.1, "motility": 0.2}, seed=7)
+        assert not sim_dir.exists()
+        mock_sim.cleanup_simdir.assert_called_once()
+
+    def test_simulate_removes_eval_dir_on_simulation_failure(self, cpm_config, cpm_mocks):
+        """Simulation failure still removes the generated eval directory."""
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        mock_sim, mock_dist = cpm_mocks
+        created_paths = []
+
+        def build_config(_param_list, out_dir_name=None):
+            config_path = Path(cpm_config["output_dir"]) / out_dir_name / "config.json"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text("{}")
+            created_paths.append(config_path.parent)
+            return str(config_path)
+
+        mock_sim.build_simulation_config.side_effect = build_config
+        mock_sim.run_simulation.side_effect = RuntimeError("NAStJA crashed")
+
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        result = bm.simulate({"division_rate": 0.1, "motility": 0.2}, seed=0)
+
+        assert result == float("inf")
+        assert len(created_paths) == 1
+        assert not created_paths[0].exists()
+        mock_sim.cleanup_simdir.assert_called_once()
+
+    def test_eval_counter_increments(self, cpm_config, cpm_mocks):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+        mock_sim, mock_dist = cpm_mocks
+        bm = CellularPotts(cpm_config, _sim_manager=mock_sim, _distance_metric=mock_dist)
+        bm.simulate({"division_rate": 0.1, "motility": 0.2}, seed=0)
+        bm.simulate({"division_rate": 0.4, "motility": 0.7}, seed=1)
+        assert bm._eval_counter == 2
+
+    def test_normalize_and_denormalize_cpm_params_round_trip(self):
+        physical = {"division_rate": 0.03, "motility": 2000.0}
+        normalized = normalize_cpm_params(physical)
+        assert normalized["division_rate"] == pytest.approx(0.0499049904990499)
+        assert normalized["motility"] == pytest.approx(0.2)
+        assert denormalize_cpm_params(normalized) == pytest.approx(physical)
+
+
+# ---------------------------------------------------------------------------
+# make_benchmark factory
+# ---------------------------------------------------------------------------
+
+class TestCellularPottsAnalysisContract:
+    """Phase 6 regression: cellular_potts.json true_param keys must match inferred columns."""
+
+    _CONFIGS_DIR = Path(__file__).parent.parent / "configs"
+
+    def _load_cpm_cfg(self) -> dict:
+        path = self._CONFIGS_DIR / "cellular_potts.json"
+        return json.loads(path.read_text())
+
+    def test_true_param_keys_match_cpm_physical_param_names(self):
+        """Config true_* keys must use bare param names (division_rate, motility).
+
+        Inferred parameter columns in the results CSV are 'division_rate' and
+        'motility' (normalized [0,1]).  Historically the config used
+        'true_division_rate_normalized' / 'true_motility_normalized', causing
+        true_params_from_benchmark_cfg to return empty → quality plots skipped.
+        """
+        from async_abc.analysis.sensitivity import true_params_from_benchmark_cfg
+
+        cfg = self._load_cpm_cfg()
+        benchmark_cfg = cfg.get("benchmark", {})
+        true_params = true_params_from_benchmark_cfg(benchmark_cfg)
+
+        assert "division_rate" in true_params, (
+            "Config must have 'true_division_rate' (not 'true_division_rate_normalized'); "
+            "got true_* keys: "
+            + str([k for k in benchmark_cfg if k.startswith("true_")])
+        )
+        assert "motility" in true_params, (
+            "Config must have 'true_motility' (not 'true_motility_normalized'); "
+            "got true_* keys: "
+            + str([k for k in benchmark_cfg if k.startswith("true_")])
+        )
+
+    def test_true_params_have_no_normalized_suffix(self):
+        """Confirm the _normalized suffix has been removed from all true_* keys."""
+        cfg = self._load_cpm_cfg()
+        bad_keys = [
+            k
+            for k in cfg.get("benchmark", {})
+            if k.startswith("true_") and k.endswith("_normalized")
+        ]
+        assert not bad_keys, (
+            f"Found true_* keys with _normalized suffix: {bad_keys}. "
+            "These do not match the inferred column names and cause quality plots to be skipped."
+        )
+
+    def test_true_params_from_cfg_warns_on_normalized_key_mismatch(self, caplog):
+        """_true_params_from_cfg warns when a true_* key does not match any inferred column."""
+        import logging
+        from async_abc.io.records import ParticleRecord
+        from async_abc.plotting.reporters import _true_params_from_cfg
+
+        records = [
+            ParticleRecord(
+                method="rejection_abc",
+                replicate=0,
+                seed=1,
+                step=1,
+                params={"division_rate": 0.05, "motility": 0.2},
+                loss=1.0,
+                wall_time=0.1,
+            )
+        ]
+        # Simulate the old (wrong) config with _normalized suffix.
+        bad_benchmark_cfg = {
+            "true_division_rate_normalized": 0.049905,
+            "true_motility_normalized": 0.2,
+        }
+        with caplog.at_level(logging.WARNING, logger="async_abc.plotting.reporters"):
+            result = _true_params_from_cfg(records, bad_benchmark_cfg)
+
+        assert result == {}, "No true_params should be returned when keys don't match columns"
+        assert any("true_division_rate_normalized" in record.getMessage() for record in caplog.records), (
+            "Expected a warning about unmapped true_* keys"
+        )
+
+
+class TestMakeBenchmark:
+    def test_gaussian_mean(self):
+        bm = make_benchmark({"name": "gaussian_mean", "observed_data_seed": 0, "n_obs": 20})
+        assert isinstance(bm, GaussianMean)
+
+    def test_gandk(self):
+        bm = make_benchmark({"name": "gandk", "observed_data_seed": 0, "n_obs": 100})
+        assert isinstance(bm, GandK)
+
+    def test_lotka_volterra(self):
+        bm = make_benchmark({"name": "lotka_volterra", "observed_data_seed": 0})
+        assert isinstance(bm, LotkaVolterra)
+
+    def test_unknown_raises(self):
+        with pytest.raises(ValueError, match="unknown"):
+            make_benchmark({"name": "unknown_model"})
+
+    def test_returns_object_with_simulate_and_limits(self):
+        bm = make_benchmark({"name": "gaussian_mean", "observed_data_seed": 0})
+        assert hasattr(bm, "simulate")
+        assert hasattr(bm, "limits")
+        assert callable(bm.simulate)
+
+
+class TestGaussianMeanND:
+    """gaussian_mean_nd: the d-dimensional target behind the k/S sweep."""
+
+    def test_per_coordinate_truth_injection_is_honoured(self):
+        """SBC injects true_mu1..true_mud, not a single true_mu.
+
+        Regression: reading only ``true_mu`` made every SBC trial generate its
+        observed data from the same default truth while the ranks were scored
+        against a freshly drawn theta, which silently destroyed calibration
+        (empirical coverage 0.08 at the 0.5 level).
+        """
+        from async_abc.benchmarks import make_benchmark
+
+        cfg = {
+            "name": "gaussian_mean_nd", "dim": 3, "n_obs": 400,
+            "sigma_obs": 1.0, "observed_data_seed": 7,
+            "true_mu1": 2.0, "true_mu2": -1.5, "true_mu3": 0.5,
+        }
+        b = make_benchmark(cfg)
+        assert list(b.true_mu) == [2.0, -1.5, 0.5]
+        # Observed data must actually follow that truth, not the default zero.
+        assert np.allclose(b.observed_mean, [2.0, -1.5, 0.5], atol=0.25)
+
+    def test_scalar_true_mu_still_broadcasts(self):
+        from async_abc.benchmarks import make_benchmark
+
+        b = make_benchmark({"name": "gaussian_mean_nd", "dim": 4, "true_mu": 1.25})
+        assert list(b.true_mu) == [1.25] * 4
+
+    def test_dim1_matches_legacy_gaussian_mean(self):
+        from async_abc.benchmarks import make_benchmark, GaussianMean
+
+        shared = {"n_obs": 100, "sigma_obs": 1.0, "prior_low": -5.0,
+                  "prior_high": 5.0, "observed_data_seed": 42}
+        nd = make_benchmark({"name": "gaussian_mean_nd", "dim": 1, **shared})
+        legacy = GaussianMean(dict(shared))
+        assert np.isclose(nd.observed_mean[0], legacy.observed_mean)
+
+    def test_discrepancy_is_smaller_at_the_truth(self):
+        from async_abc.benchmarks import make_benchmark
+
+        b = make_benchmark({"name": "gaussian_mean_nd", "dim": 4, "n_obs": 100,
+                            "observed_data_seed": 1, "true_mu": 0.0})
+        at_truth = np.median([b.simulate({f"mu{j+1}": 0.0 for j in range(4)}, s)
+                              for s in range(30)])
+        far = np.median([b.simulate({f"mu{j+1}": 3.0 for j in range(4)}, s)
+                         for s in range(30)])
+        assert at_truth < far
+
+
+class TestLotkaVolterraExtinction:
+    """The extinction rate is a property of the benchmark the paper reports on.
+
+    At the configured true parameters roughly 98% of simulations hit the
+    absorbing state and return EXTINCTION_LOSS, so they carry no information
+    about the summaries under a smooth kernel. That bounds how the
+    posterior-recovery results on this benchmark can be read (the throughput
+    results are unaffected -- an extinct simulation costs what a surviving one
+    costs). See scripts/diag_lv_extinction.py.
+
+    If these ever start passing with much higher survival, the benchmark's
+    configuration changed and the paper's scoping of it needs revisiting.
+    """
+
+    @staticmethod
+    def _bm():
+        from async_abc.benchmarks.lotka_volterra import LotkaVolterra
+
+        return LotkaVolterra({
+            "name": "lotka_volterra", "observed_data_seed": 42, "T_max": 30.0,
+            "x0": 50, "y0": 100, "true_theta1": 0.5, "true_theta2": 0.025,
+            "true_theta3": 0.025, "true_theta4": 0.5,
+        })
+
+    def test_most_simulations_at_the_truth_go_extinct(self):
+        from async_abc.benchmarks.lotka_volterra import EXTINCTION_LOSS
+
+        bm = self._bm()
+        truth = {"theta1": 0.5, "theta2": 0.025, "theta3": 0.025, "theta4": 0.5}
+        losses = np.array([bm.simulate(truth, seed=s) for s in range(300)])
+        survival = float((losses < EXTINCTION_LOSS).mean())
+        assert 0.0 < survival < 0.10, f"survival rate {survival:.3f}, expected ~0.026"
+
+    def test_the_observed_trajectory_is_survival_conditioned(self):
+        """__init__ re-draws until a trajectory survives, so the observed data
+        is not a typical draw from the true parameters -- which is why the ABC
+        target is p(theta | s_obs, survived)."""
+        from async_abc.benchmarks.lotka_volterra import _gillespie
+
+        bm = self._bm()
+        rng = np.random.default_rng(42)
+        _, xs, ys = _gillespie(bm.x0, bm.y0, (0.5, 0.025, 0.025, 0.5), 30.0, rng)
+        assert xs[-1] == 0 or ys[-1] == 0, (
+            "the first observed draw now survives; the retry loop is no longer "
+            "load-bearing and the conditioning note can be dropped"
+        )
+        assert np.all(np.isfinite(bm.observed_stats))
+
+
+class TestCPMLogScaledPriors:
+    """A log-uniform prior on a CPM parameter.
+
+    division_rate's response is confined to the bottom of its range, so a uniform
+    prior on that range spends most of its mass where the discrepancy is flat --
+    the measured cause of the flat CPM posterior. A log scale is how the prior is
+    placed over the response instead.
+    """
+
+    LIMITS = {"division_rate": (0.001, 0.2)}
+    SCALES = {"division_rate": "log"}
+
+    def test_log_scale_round_trips(self):
+        from async_abc.benchmarks.cellular_potts import (
+            denormalize_cpm_param,
+            normalize_cpm_param,
+        )
+
+        for physical in (0.001, 0.009, 0.05, 0.2):
+            u = normalize_cpm_param("division_rate", physical, self.LIMITS, self.SCALES)
+            assert 0.0 <= u <= 1.0
+            assert denormalize_cpm_param(
+                "division_rate", u, self.LIMITS, self.SCALES
+            ) == pytest.approx(physical)
+
+    def test_log_scale_puts_the_geometric_midpoint_at_one_half(self):
+        from async_abc.benchmarks.cellular_potts import denormalize_cpm_param
+
+        midpoint = denormalize_cpm_param("division_rate", 0.5, self.LIMITS, self.SCALES)
+        assert midpoint == pytest.approx(math.sqrt(0.001 * 0.2))
+        # The point of the change: linear would have put 0.1005 here, which is above
+        # the entire responsive window.
+        linear = denormalize_cpm_param("division_rate", 0.5, self.LIMITS)
+        assert linear == pytest.approx(0.1005)
+
+    def test_absent_scale_is_linear(self):
+        from async_abc.benchmarks.cellular_potts import denormalize_cpm_param
+
+        assert denormalize_cpm_param(
+            "division_rate", 0.25, self.LIMITS, {}
+        ) == pytest.approx(0.001 + 0.25 * 0.199)
+
+    def test_nonpositive_lower_bound_is_refused(self):
+        from async_abc.benchmarks.cellular_potts import denormalize_cpm_param
+
+        with pytest.raises(ValueError, match="strictly positive lower bound"):
+            denormalize_cpm_param("motility", 0.5, {"motility": (0.0, 4000.0)},
+                                  {"motility": "log"})
+
+    def test_unknown_scale_is_refused(self):
+        from async_abc.benchmarks.cellular_potts import normalize_cpm_param
+
+        with pytest.raises(ValueError, match="expected one of"):
+            normalize_cpm_param("division_rate", 0.01, self.LIMITS,
+                                {"division_rate": "quadratic"})
+
+    @pytest.mark.skipif(not _NASTJAPY_AVAILABLE, reason="nastjapy not available")
+    def test_parameter_space_scale_is_read_and_validated(self, tmp_path):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        space = tmp_path / "space.json"
+        space.write_text(json.dumps({"parameters": {"division_rate": {
+            "path": "define_functions.division_cond_cancer[1]",
+            "range": [0.0, 1.0], "physical_range": [0.0, 0.2], "scale": "log"}}}))
+        config = {
+            "nastja_config_template": "experiments/assets/cellular_potts/sim_config.json",
+            "config_builder_params": "experiments/assets/cellular_potts/config_builder_params.json",
+            "distance_metric_params": "experiments/assets/cellular_potts/distance_metric_params.json",
+            "parameter_space": str(space),
+            "reference_data_path": "experiments/assets/cellular_potts/reference_data",
+            "output_dir": str(tmp_path / "sims"),
+        }
+        with pytest.raises(ValueError, match="strictly positive lower bound"):
+            CellularPotts(config, _sim_manager=object(), _distance_metric=object())
+
+
+class TestCPMFixedParameters:
+    """Parameters applied to every simulation but not inferred."""
+
+    def _space(self, tmp_path, fixed):
+        space = tmp_path / "space.json"
+        space.write_text(json.dumps({
+            "parameters": {"division_rate": {
+                "path": "define_functions.division_cond_cancer[1]",
+                "range": [0.0, 1.0], "physical_range": [0.001, 0.2], "scale": "log"}},
+            "fixed": fixed,
+        }))
+        return {
+            "nastja_config_template": "experiments/assets/cellular_potts/sim_config.json",
+            "config_builder_params": "experiments/assets/cellular_potts/config_builder_params.json",
+            "distance_metric_params": "experiments/assets/cellular_potts/distance_metric_params.json",
+            "parameter_space": str(space),
+            "reference_data_path": "experiments/assets/cellular_potts/reference_data",
+            "output_dir": str(tmp_path / "sims"),
+        }
+
+    @pytest.mark.skipif(not _NASTJAPY_AVAILABLE, reason="nastjapy not available")
+    def test_fixed_parameters_reach_every_simulation(self, tmp_path):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        config = self._space(tmp_path, {"motility": {
+            "path": "CellsInSilico.orientation.motilityamount[9]", "value": 1400}})
+        recorded = {}
+
+        class _Manager:
+            def build_simulation_config(self, param_list, out_dir_name):
+                recorded["names"] = {p.name: p.value for p in param_list.parameters}
+                raise RuntimeError("stop after the parameter list is built")
+
+        benchmark = CellularPotts(config, _sim_manager=_Manager(),
+                                  _distance_metric=object())
+        assert benchmark.simulate({"division_rate": 0.5}, seed=3) == float("inf")
+        assert recorded["names"]["motility"] == 1400
+        assert recorded["names"]["random_seed"] == 3
+
+    @pytest.mark.skipif(not _NASTJAPY_AVAILABLE, reason="nastjapy not available")
+    def test_a_parameter_cannot_be_both_inferred_and_fixed(self, tmp_path):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        config = self._space(tmp_path, {"division_rate": {
+            "path": "define_functions.division_cond_cancer[1]", "value": 0.01}})
+        with pytest.raises(ValueError, match="both inferred and fixed"):
+            CellularPotts(config, _sim_manager=object(), _distance_metric=object())
+
+    @pytest.mark.skipif(not _NASTJAPY_AVAILABLE, reason="nastjapy not available")
+    def test_fixed_parameter_needs_a_path_and_a_value(self, tmp_path):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        config = self._space(tmp_path, {"motility": {"value": 1400}})
+        with pytest.raises(KeyError, match="needs both 'path' and 'value'"):
+            CellularPotts(config, _sim_manager=object(), _distance_metric=object())
+
+
+class TestCPMReplicateSeeds:
+    """Deterministic, distinct NAStJA seeds for the replicates of one evaluation."""
+
+    def test_one_replicate_is_the_evaluation_seed(self):
+        from async_abc.benchmarks.cellular_potts import replicate_seeds
+
+        assert replicate_seeds(99, 1) == [99]
+
+    def test_the_first_replicate_is_always_the_evaluation_seed(self):
+        from async_abc.benchmarks.cellular_potts import replicate_seeds
+
+        assert replicate_seeds(7, 4)[0] == 7
+
+    def test_seeds_are_distinct(self):
+        from async_abc.benchmarks.cellular_potts import replicate_seeds
+
+        seeds = replicate_seeds(3, 8)
+        assert len(set(seeds)) == 8
+
+    def test_seeds_are_deterministic_in_the_evaluation_seed(self):
+        from async_abc.benchmarks.cellular_potts import replicate_seeds
+
+        assert replicate_seeds(12345, 4) == replicate_seeds(12345, 4)
+
+    def test_a_prefix_property_holds_across_k(self):
+        """k=4 extends k=2 rather than redrawing, so k is a protocol knob and not a
+        different experiment on the same seeds."""
+        from async_abc.benchmarks.cellular_potts import replicate_seeds
+
+        assert replicate_seeds(5, 4)[:2] == replicate_seeds(5, 2)
+
+    def test_different_evaluations_get_different_replicates(self):
+        from async_abc.benchmarks.cellular_potts import replicate_seeds
+
+        a, b = replicate_seeds(1, 4), replicate_seeds(2, 4)
+        assert not set(a) & set(b)
+
+    def test_seeds_are_positive_32_bit_integers(self):
+        from async_abc.benchmarks.cellular_potts import replicate_seeds
+
+        for seed in replicate_seeds(1_000_000, 16):
+            assert isinstance(seed, int)
+            assert 1 <= seed <= 2 ** 31 - 1
+
+    def test_zero_replicates_is_refused(self):
+        from async_abc.benchmarks.cellular_potts import replicate_seeds
+
+        with pytest.raises(ValueError, match=">= 1"):
+            replicate_seeds(1, 0)
+
+
+class TestCPMReplicateAveraging:
+    """One evaluation = k simulations at the same theta, averaged before the distance.
+
+    A single 50^3 realisation is too noisy for the discrepancy to order nearby
+    thetas; k=4 is what the posterior forecasts in
+    .plans/cpm_setup_proposal_2026-09-19.md were computed under. Until this was
+    wired, ``n_replicates_per_evaluation`` sat in the configs and nothing read it.
+    """
+
+    @staticmethod
+    def _sim_manager(record):
+        """A SimulationManager that writes a real per-replicate directory."""
+        manager = MagicMock()
+
+        def build(param_list, out_dir_name=None):
+            record["param_lists"].append(param_list)
+            config_path = Path(record["root"]) / out_dir_name / "config.json"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text("{}")
+            record["dirs"].append(config_path.parent)
+            return str(config_path)
+
+        manager.build_simulation_config.side_effect = build
+        return manager
+
+    def _benchmark(self, cpm_config, record, **extra):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        record.setdefault("root", cpm_config["output_dir"])
+        record.setdefault("param_lists", [])
+        record.setdefault("dirs", [])
+        mock_dist = MagicMock()
+        mock_dist.calculate_distance.return_value = 2.5
+        mock_dist.calculate_distance_replicates.return_value = 1.25
+        cpm_config.update(extra)
+        benchmark = CellularPotts(
+            cpm_config,
+            _sim_manager=self._sim_manager(record),
+            _distance_metric=mock_dist,
+        )
+        return benchmark, mock_dist
+
+    def test_four_replicates_run_four_simulations(self, cpm_config):
+        record = {}
+        bm, _ = self._benchmark(cpm_config, record, n_replicates_per_evaluation=4)
+        bm.simulate({"division_rate": 0.4, "motility": 0.2}, seed=42)
+        assert len(record["dirs"]) == 4
+        assert bm._sim_manager.run_simulation.call_count == 4
+
+    def test_each_replicate_gets_its_own_seed(self, cpm_config):
+        from async_abc.benchmarks.cellular_potts import replicate_seeds
+
+        record = {}
+        bm, _ = self._benchmark(cpm_config, record, n_replicates_per_evaluation=4)
+        bm.simulate({"division_rate": 0.4, "motility": 0.2}, seed=42)
+        seeds = [
+            next(p.value for p in pl.parameters if p.name == "random_seed")
+            for pl in record["param_lists"]
+        ]
+        assert seeds == replicate_seeds(42, 4)
+        assert len(set(seeds)) == 4
+
+    def test_every_replicate_carries_the_same_parameters(self, cpm_config):
+        record = {}
+        bm, _ = self._benchmark(cpm_config, record, n_replicates_per_evaluation=4)
+        bm.simulate({"division_rate": 0.4, "motility": 0.2}, seed=42)
+        thetas = [
+            {p.name: p.value for p in pl.parameters if p.name != "random_seed"}
+            for pl in record["param_lists"]
+        ]
+        assert all(theta == thetas[0] for theta in thetas)
+
+    def test_replicates_are_scored_together_through_the_averaging_path(self, cpm_config):
+        """Features are averaged across replicates and *then* compared -- averaging
+        distances instead would not divide the within-theta noise by k."""
+        record = {}
+        bm, mock_dist = self._benchmark(cpm_config, record, n_replicates_per_evaluation=4)
+        result = bm.simulate({"division_rate": 0.4, "motility": 0.2}, seed=42)
+        mock_dist.calculate_distance.assert_not_called()
+        mock_dist.calculate_distance_replicates.assert_called_once()
+        passed = list(mock_dist.calculate_distance_replicates.call_args.args[0])
+        assert [Path(p) for p in passed] == record["dirs"]
+        assert result == pytest.approx(1.25)
+
+    def test_the_default_is_one_replicate_through_the_single_path(self, cpm_config):
+        record = {}
+        bm, mock_dist = self._benchmark(cpm_config, record)
+        result = bm.simulate({"division_rate": 0.4, "motility": 0.2}, seed=42)
+        assert len(record["dirs"]) == 1
+        mock_dist.calculate_distance.assert_called_once()
+        mock_dist.calculate_distance_replicates.assert_not_called()
+        assert result == pytest.approx(2.5)
+
+    def test_every_replicate_directory_is_cleaned_up(self, cpm_config):
+        record = {}
+        bm, _ = self._benchmark(cpm_config, record, n_replicates_per_evaluation=4)
+        bm.simulate({"division_rate": 0.4, "motility": 0.2}, seed=42)
+        assert not any(d.exists() for d in record["dirs"])
+        assert bm._sim_manager.cleanup_simdir.call_count == 4
+
+    def test_a_failed_replicate_fails_the_evaluation_and_cleans_the_rest(self, cpm_config):
+        """An evaluation averaged over fewer replicates than the others carries more
+        noise than the tolerance schedule was set for, so it is not the same
+        evaluation: the whole evaluation is a failure."""
+        record = {}
+        bm, mock_dist = self._benchmark(cpm_config, record, n_replicates_per_evaluation=4)
+        calls = {"n": 0}
+
+        def run(_config_path):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise RuntimeError("NAStJA crashed")
+
+        bm._sim_manager.run_simulation.side_effect = run
+        result = bm.simulate({"division_rate": 0.4, "motility": 0.2}, seed=42)
+        assert result == float("inf")
+        assert calls["n"] == 3  # stops at the failure, does not run the fourth
+        assert not any(d.exists() for d in record["dirs"])
+        mock_dist.calculate_distance_replicates.assert_not_called()
+        assert bm._nan_counter == 1
+
+    def test_a_failed_distance_still_removes_every_replicate(self, cpm_config):
+        record = {}
+        bm, mock_dist = self._benchmark(cpm_config, record, n_replicates_per_evaluation=4)
+        mock_dist.calculate_distance_replicates.side_effect = ValueError("degenerate")
+        result = bm.simulate({"division_rate": 0.4, "motility": 0.2}, seed=42)
+        assert result == float("inf")
+        assert not any(d.exists() for d in record["dirs"])
+
+    def test_a_nan_replicate_distance_maps_to_inf(self, cpm_config):
+        record = {}
+        bm, mock_dist = self._benchmark(cpm_config, record, n_replicates_per_evaluation=4)
+        mock_dist.calculate_distance_replicates.return_value = float("nan")
+        assert bm.simulate({"division_rate": 0.4, "motility": 0.2}, seed=42) == float("inf")
+
+    def test_one_evaluation_counts_once_however_many_replicates(self, cpm_config):
+        record = {}
+        bm, _ = self._benchmark(cpm_config, record, n_replicates_per_evaluation=4)
+        bm.simulate({"division_rate": 0.4, "motility": 0.2}, seed=42)
+        bm.simulate({"division_rate": 0.5, "motility": 0.3}, seed=43)
+        assert bm._eval_counter == 2
+
+    def test_repeating_an_evaluation_repeats_its_replicate_seeds(self, cpm_config):
+        record = {}
+        bm, _ = self._benchmark(cpm_config, record, n_replicates_per_evaluation=4)
+        bm.simulate({"division_rate": 0.4, "motility": 0.2}, seed=42)
+        first = [
+            next(p.value for p in pl.parameters if p.name == "random_seed")
+            for pl in record["param_lists"]
+        ]
+        record["param_lists"].clear()
+        bm.simulate({"division_rate": 0.4, "motility": 0.2}, seed=42)
+        second = [
+            next(p.value for p in pl.parameters if p.name == "random_seed")
+            for pl in record["param_lists"]
+        ]
+        assert first == second
+
+    def test_a_nonsense_replicate_count_is_refused(self, cpm_config):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        cpm_config["n_replicates_per_evaluation"] = 0
+        with pytest.raises(ValueError, match="must be >= 1"):
+            CellularPotts(cpm_config, _sim_manager=MagicMock(), _distance_metric=MagicMock())
+
+
+class TestCPMAveragedReference:
+    """The observed data as one replicate-averaged observation.
+
+    ``DistanceMetric`` averages the distance to each reference directory; the
+    screening forecasts were computed against the *average of the references*,
+    which is a different (and half as noisy) observation.
+    """
+
+    class _Handler:
+        def __init__(self, value):
+            self.features = {"log_n": np.array([value]), "log_r95": np.array([2 * value])}
+            self.feature_metadata = {}
+            self.closed = False
+            self._SimDir__con = self
+
+        def close(self):
+            self.closed = True
+
+    @staticmethod
+    def _metric(handlers, with_model=True):
+        """A DistanceMetric stand-in exposing the pieces the collapse touches."""
+        metric = MagicMock()
+        metric.reference_data = list(handlers)
+        metric.feature_space_model = object() if with_model else None
+
+        def average(dhs):
+            item = MagicMock()
+            item.features = {
+                name: np.mean([dh.features[name] for dh in dhs], axis=0)
+                for name in dhs[0].features
+            }
+            return item
+
+        metric._average_feature_item.side_effect = average
+        return metric
+
+    def _config(self, cpm_config, **extra):
+        cpm_config.update(extra)
+        return cpm_config
+
+    def test_reference_replicates_collapse_to_their_average(self, cpm_config):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        handlers = [self._Handler(v) for v in (1.0, 2.0, 3.0, 4.0)]
+        metric = self._metric(handlers)
+        CellularPotts(
+            self._config(cpm_config, average_reference_replicates=True),
+            _sim_manager=MagicMock(), _distance_metric=metric,
+        )
+        assert len(metric.reference_data) == 1
+        assert metric.reference_data[0].features["log_n"] == pytest.approx([2.5])
+
+    def test_without_the_flag_the_references_are_left_alone(self, cpm_config):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        handlers = [self._Handler(v) for v in (1.0, 2.0, 3.0, 4.0)]
+        metric = self._metric(handlers)
+        CellularPotts(cpm_config, _sim_manager=MagicMock(), _distance_metric=metric)
+        assert metric.reference_data == handlers
+
+    def test_a_single_reference_is_not_touched(self, cpm_config):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        handlers = [self._Handler(1.0)]
+        metric = self._metric(handlers)
+        CellularPotts(
+            self._config(cpm_config, average_reference_replicates=True),
+            _sim_manager=MagicMock(), _distance_metric=metric,
+        )
+        assert metric.reference_data == handlers
+
+    def test_averaging_without_a_feature_space_model_is_refused(self, cpm_config):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        metric = self._metric([self._Handler(1.0), self._Handler(2.0)], with_model=False)
+        with pytest.raises(ValueError, match="requires a feature_space_model"):
+            CellularPotts(
+                self._config(cpm_config, average_reference_replicates=True),
+                _sim_manager=MagicMock(), _distance_metric=metric,
+            )
+
+    def test_close_reaches_the_connection_through_sim_dir(self, cpm_config, caplog):
+        """The sqlite connection belongs to nastjapy's SimDir, not to the
+        DataHandler: looking for ``_SimDir__con`` on the handler itself found
+        nothing and warned on every close."""
+        import logging
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        class _SimDir:
+            def __init__(self):
+                self.closed = False
+                self._SimDir__con = self
+
+            def close(self):
+                self.closed = True
+
+        class _Handler:
+            def __init__(self):
+                self.features, self.feature_metadata = {}, {}
+                self.sim_dir = _SimDir()
+
+        handlers = [_Handler(), _Handler()]
+        metric = MagicMock()
+        metric.reference_data = list(handlers)
+        benchmark = CellularPotts(cpm_config, _sim_manager=MagicMock(),
+                                  _distance_metric=metric)
+        with caplog.at_level(logging.WARNING,
+                             logger="async_abc.benchmarks.cellular_potts"):
+            benchmark.close()
+        assert all(handler.sim_dir.closed for handler in handlers)
+        assert not [r for r in caplog.records if "Cannot close" in r.getMessage()]
+
+    def test_close_still_closes_the_original_reference_handlers(self, cpm_config):
+        from async_abc.benchmarks.cellular_potts import CellularPotts
+
+        handlers = [self._Handler(v) for v in (1.0, 2.0)]
+        metric = self._metric(handlers)
+        benchmark = CellularPotts(
+            self._config(cpm_config, average_reference_replicates=True),
+            _sim_manager=MagicMock(), _distance_metric=metric,
+        )
+        benchmark.close()
+        assert all(handler.closed for handler in handlers)
+
+
+class TestCPMProposedConfigsRequestReplicates:
+    """The two proposed CPM setups must actually ask for the protocol they were
+    forecast under: four replicate seeds and one averaged four-seed reference."""
+
+    _CONFIGS = ["cellular_potts_two_param.json", "cellular_potts_division_only.json"]
+
+    @pytest.mark.parametrize("name", _CONFIGS)
+    def test_config_asks_for_four_replicates_against_an_averaged_reference(self, name):
+        cfg = json.loads((Path(__file__).parents[1] / "configs" / name).read_text())
+        benchmark = cfg["benchmark"]
+        assert benchmark["n_replicates_per_evaluation"] == 4
+        assert benchmark["average_reference_replicates"] is True
+
+    @pytest.mark.parametrize("name", _CONFIGS)
+    def test_the_reference_container_holds_four_seed_replicates(self, name):
+        cfg = json.loads((Path(__file__).parents[1] / "configs" / name).read_text())
+        reference = Path(__file__).parents[2] / cfg["benchmark"]["reference_data_path"]
+        assert len([p for p in reference.iterdir() if p.is_dir()]) == 4
+
+
+class TestCPMMultiSeedReferenceContainer:
+    """``generate_cpm_reference.py --n-seeds N`` writes a container of reference dirs."""
+
+    def _reference(self, path):
+        path.mkdir(parents=True)
+        (path / "config.json").write_text("{}")
+        (path / "cis.out").write_text("")
+        (path / "configs").mkdir()
+        (path / "000000").mkdir()
+        (path / "000000" / "cellevents.log").write_text("")
+        (path / "output_cells-00000.csv").write_text("#CellID\n")
+
+    def test_container_of_seed_replicates_expands_to_all_of_them(self, tmp_path):
+        from async_abc.benchmarks.cellular_potts import _collect_reference_paths
+
+        container = tmp_path / "cpm_reference_multi"
+        for seed in range(3):
+            self._reference(container / f"reference_seed_{seed}")
+        found = _collect_reference_paths(container)
+        assert [pathlib.Path(p).name for p in found] == [
+            "reference_seed_0", "reference_seed_1", "reference_seed_2"]
+
+    def test_a_single_reference_directory_still_resolves_to_itself(self, tmp_path):
+        from async_abc.benchmarks.cellular_potts import _collect_reference_paths
+
+        single = tmp_path / "reference"
+        self._reference(single)
+        assert _collect_reference_paths(single) == [str(single)]

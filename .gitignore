@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+# outputs of the figure scripts and of experiment runs
+figures/
+results/
+schematic/algorithm_strip/out/

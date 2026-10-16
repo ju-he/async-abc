@@ -1,0 +1,35 @@
+% A10 integrated figure (fig:algorithm-strip): horizontal with the step spine between the rows, bullets, gray bands (= a10_MBG). Switches for a10_body.tikz (V vertical, B bullets, G bands).
+\documentclass[tikz,border=1pt]{standalone}
+\usepackage{newtxtext,newtxmath}
+\usepackage{graphicx}
+\usetikzlibrary{arrows.meta,calc,backgrounds}
+\definecolor{async}{HTML}{0072B2}
+\definecolor{sync}{HTML}{D55E00}
+\def\variantV{0}\def\variantM{1}\def\variantB{1}\def\variantG{1}
+% Wording of the paper figure: sentence case, no run-specific counts, no bootstrap/frame
+% notes (the paper's appendix covers both). The body only defines these when undefined.
+\def\namesList{1/{History},2/{Bandwidth},3/{Archive weights},4/{Proposal},5/{One draw},6/{Weight}}
+\def\labelsA{%
+  1/{The current population only; earlier generations are discarded},
+  2/{Next threshold: a quantile of the population's discrepancies; accept or reject},
+  3/{Weights carried over from the last generation; covariance from them},
+  4/{One mixture proposal over the whole population},
+  5/{Propose, simulate, accept or reject, one candidate at a time, until $N$ are kept},
+  6/{The kept are weighted against that one proposal, after acceptance}}
+\def\labelsB{%
+  1/{Every particle ever evaluated, with its stored bandwidth and weight},
+  2/{The $k$ best form the archive; a smooth kernel of width $\epsilon_n$, which only ever tightens},
+  3/{Archive weights: stored weight times kernel weight; covariance from them},
+  4/{One mixture proposal over the archive, rebuilt at every call},
+  5/{One candidate: a parent drawn by weight, then perturbed},
+  6/{Weighted against the current proposal and the $S$ stored proposals, before it is simulated}}
+\def\titleA{(a) Textbook ABC-PMC, schematic: one update per generation}
+\def\stageA{shown at generation $t\to t+1$}
+\def\titleB{(b) Generation-free (ours): one update per arrival}
+\def\stageB{}
+\def\barrierA{Barrier: $q_{t+1}$ needs the complete $P_{t+1}$}
+\def\bootB{}
+\def\frameNote{}
+\begin{document}
+\input{a10_body.tikz}
+\end{document}

@@ -1,0 +1,148 @@
+#!/bin/bash -x
+# Run multiple low-rank scaling worker-count jobs inside one full-node allocation.
+#
+# Usage:
+#   sbatch --ntasks=48 --nodes=1 scaling_packed.sh <output_dir> \
+#       --workers 1,4,8,16 [--config /path/to/scaling.json] [--test] [--small] [--extend]
+#
+# Called by submit_scaling.py for worker counts smaller than the node size.
+#
+#SBATCH --ntasks=48
+#SBATCH --cpus-per-task=1
+#SBATCH --threads-per-core=2
+#SBATCH --time=00:30:00
+#SBATCH --partition=batch
+#SBATCH --job-name=abc_scaling_bundle
+#SBATCH --output=/tmp/abc_scaling_bundle-%j.out
+
+set -u
+
+# Paths are injected by submit_scaling.py (or submit.sh) via `sbatch --export`.
+nastjapy_path="${NASTJAPY_PATH:?NASTJAPY_PATH not set — submit via submit_scaling.py}"
+experiments_dir="${EXPERIMENTS_DIR:?EXPERIMENTS_DIR not set — submit via submit_scaling.py}"
+config_path="$experiments_dir/configs/scaling.json"
+output_dir=""
+workers_csv=""
+test_flag=""
+small_flag=""
+extend_flag=""
+
+usage() {
+    echo "Usage: $(basename "$0") <output_dir> --workers 1,4,8 [--config PATH] [--test] [--small] [--extend]" >&2
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --workers)
+            shift
+            if [ "$#" -eq 0 ]; then
+                usage
+                echo "Missing value for --workers" >&2
+                exit 2
+            fi
+            workers_csv="$1"
+            ;;
+        --config)
+            shift
+            if [ "$#" -eq 0 ]; then
+                usage
+                echo "Missing value for --config" >&2
+                exit 2
+            fi
+            config_path="$1"
+            ;;
+        --test)
+            test_flag="--test"
+            ;;
+        --small)
+            small_flag="--small"
+            ;;
+        --extend)
+            extend_flag="--extend"
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            usage
+            echo "Unknown option: $1" >&2
+            exit 2
+            ;;
+        *)
+            if [ -n "$output_dir" ]; then
+                usage
+                echo "Unexpected extra argument: $1" >&2
+                exit 2
+            fi
+            output_dir="$1"
+            ;;
+    esac
+    shift
+done
+
+if [ -z "$output_dir" ] || [ -z "$workers_csv" ]; then
+    usage
+    exit 2
+fi
+
+IFS=',' read -r -a workers <<< "$workers_csv"
+if [ "${#workers[@]}" -eq 0 ]; then
+    echo "No workers parsed from --workers=$workers_csv" >&2
+    exit 2
+fi
+
+# Environment setup. Override SCALING_ENV_SETUP to point at a script that loads a
+# different MPI stack + activates a matching venv — e.g. an OpenMPI-linked mpi4py
+# venv to sidestep the ParaStation pscom teardown hang at high message volume.
+# Default keeps ParaStation+nastja unchanged. The setup script owns both the
+# module loads AND `source <venv>/bin/activate`.
+if [ -n "${SCALING_ENV_SETUP:-}" ]; then
+    # shellcheck source=/dev/null
+    source "$SCALING_ENV_SETUP"
+else
+    module restore nastjapy
+    module load ParaStationMPI
+    source "$nastjapy_path/.venv/bin/activate"
+fi
+
+mkdir -p "$output_dir"
+cp "$0" "$output_dir/" 2>/dev/null || true
+
+# Same rationale as scaling_single.sh: scaling runs never resume (a crashed
+# combo's checkpoint poisons the recompute) and the per-generation population
+# pickling distorts the throughput measurement.
+export PROPULATE_DISABLE_CHECKPOINT="${PROPULATE_DISABLE_CHECKPOINT:-1}"
+
+pids=()
+failed=0
+had_any_run=0
+for n_workers in "${workers[@]}"; do
+    srun --exclusive -N 1 -n "$n_workers" python "$experiments_dir/scripts/scaling_runner.py" \
+        --config "$config_path" \
+        --output-dir "$output_dir" \
+        --n-workers "$n_workers" \
+        --skip-finalize \
+        ${test_flag:+"$test_flag"} \
+        ${small_flag:+"$small_flag"} \
+        ${extend_flag:+"$extend_flag"} &
+    pids+=("$!")
+    had_any_run=1
+done
+
+for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+        failed=1
+    fi
+done
+
+if [ "$had_any_run" -ne 0 ]; then
+    python "$experiments_dir/scripts/scaling_runner.py" \
+        --config "$config_path" \
+        --output-dir "$output_dir" \
+        --finalize-only \
+        ${test_flag:+"$test_flag"} \
+        ${small_flag:+"$small_flag"}
+fi
+
+exit "$failed"
